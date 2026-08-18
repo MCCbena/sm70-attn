@@ -50,8 +50,8 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
         #pragma unroll
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const int row_idx = row_idx_base + i * 8;
-            const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-            const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+            const int col_idx_limit_left = (row_idx + max_seqlen_k - max_seqlen_q - window_size_left) > 0 ? (row_idx + max_seqlen_k - max_seqlen_q - window_size_left) : 0;  // std::max -> ternary (no __host__ calls in device code)
+            const int col_idx_limit_right = (row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right) < max_seqlen_k ? (row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right) : max_seqlen_k;  // std::min -> ternary
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const int col_idx_base = col_idx_offset + nj * 8;
@@ -93,7 +93,7 @@ __forceinline__ __device__ void apply_mask_causal_w_idx(
     CUTE_STATIC_ASSERT_V(size<1>(tensor) == size<1>(idx_rowcol));
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
-        const int col_idx_limit = std::min(max_seqlen_k, 1 + row_idx_offset + get<0>(idx_rowcol(mi, 0)));
+        const int col_idx_limit = (1 + row_idx_offset + get<0>(idx_rowcol(mi, 0))) < max_seqlen_k ? (1 + row_idx_offset + get<0>(idx_rowcol(mi, 0))) : max_seqlen_k;  // std::min -> ternary
         #pragma unroll
         for (int ni = 0; ni < size<1, 1>(tensor); ++ni) {
             if (col_idx_offset_ + get<1>(idx_rowcol(0, ni)) >= col_idx_limit) {
@@ -216,8 +216,8 @@ struct Mask {
                     #pragma unroll
                     for (int i = 0; i < size<0, 0>(tensor); ++i) {
                         const int row_idx = sm70_mask_row_idx<kWarpRows>(lane_row_base, row_idx_offset, i, mi);
-                        const int col_idx_limit_left = std::max(0, row_idx + seqlen_delta - window_size_left);
-                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + seqlen_delta + window_size_right);
+                        const int col_idx_limit_left = (row_idx + seqlen_delta - window_size_left) > 0 ? (row_idx + seqlen_delta - window_size_left) : 0;  // std::max -> ternary
+                        const int col_idx_limit_right = (row_idx + 1 + seqlen_delta + window_size_right) < max_seqlen_k ? (row_idx + 1 + seqlen_delta + window_size_right) : max_seqlen_k;  // std::min -> ternary
 
                         #pragma unroll
                         for (int n = 0; n < size<1, 2>(tensor); ++n) {
