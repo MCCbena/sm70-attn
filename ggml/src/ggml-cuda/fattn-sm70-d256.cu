@@ -38,6 +38,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-sm70-d256-kernel.cuh"
+#include <cstdio>
 
 #ifndef M_LOG2E
 #define M_LOG2E 1.4426950408889634f
@@ -149,9 +150,39 @@ static bool sm70_env_disabled() {
     return disabled;
 }
 
+// Routing probe: prints why a decision was made. Default = first decision
+// only; set LLAMA_SM70_D256_DEBUG=1 for every call.
+static void sm70_d256_probe(const char * reason, int cc,
+                            const ggml_tensor * Q, const ggml_tensor * K,
+                            const ggml_tensor * V, const ggml_tensor * mask) {
+    static const bool verbose = getenv("LLAMA_SM70_D256_DEBUG") != nullptr;
+    static bool first = true;
+    if (!verbose && !first) {
+        return;
+    }
+    first = false;
+    fprintf(stderr, "[sm70-d256] %s | cc=%d Q=(%lld,%lld,%lld,%lld) Qtype=%d "
+            "K=(%lld,%lld,%lld,%lld) Ktype=%d Knb0=%llu rowK=%llu "
+            "Vtype=%d Vnb0=%llu rowV=%llu mask=%p\n",
+            reason, cc,
+            (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], (int) Q->type,
+            (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], (int) K->type,
+            (unsigned long long) K->nb[0], (unsigned long long) ggml_row_size(K->type, K->ne[0]),
+            (int) V->type, (unsigned long long) V->nb[0], (unsigned long long) ggml_row_size(V->type, V->ne[0]),
+            (const void *) mask);
+}
+
 // ------------------------------------------------------------------- public
 bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (cc != GGML_CUDA_CC_VOLTA || sm70_env_disabled()) {
+        // probe only when cc is volta (the interesting case for the probe)
+        if (cc == GGML_CUDA_CC_VOLTA) {
+            const ggml_tensor * Qp = dst->src[0];
+            const ggml_tensor * Kp = dst->src[1];
+            const ggml_tensor * Vp = dst->src[2];
+            const ggml_tensor * Mp = dst->src[3];
+            sm70_d256_probe(cc != GGML_CUDA_CC_VOLTA ? "REJECT: cc!=volta" : "REJECT: env disabled", cc, Qp, Kp, Vp, Mp);
+        }
         return false;
     }
     const ggml_tensor * Q = dst->src[0];
@@ -159,22 +190,28 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     if (Q->ne[0] != SM70_D256_D || K->ne[0] != SM70_D256_D || V->ne[0] != SM70_D256_D) {
+        sm70_d256_probe("REJECT: head_dim != 256", cc, Q, K, V, mask);
         return false;
     }
     if (!mask || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
+        sm70_d256_probe("REJECT: no mask or q_len < 256", cc, Q, K, V, mask);
         return false;
     }
     if (Q->ne[2] % K->ne[2] != 0) {
+        sm70_d256_probe("REJECT: gqa ratio", cc, Q, K, V, mask);
         return false;
     }
     const bool kv_ok = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_Q4_0)
                     && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32 || V->type == GGML_TYPE_Q4_0);
     if (!kv_ok) {
+        sm70_d256_probe("REJECT: kv type", cc, Q, K, V, mask);
         return false;
     }
     if (K->nb[0] != ggml_row_size(K->type, K->ne[0]) || V->nb[0] != ggml_row_size(V->type, V->ne[0])) {
+        sm70_d256_probe("REJECT: nb0 != row_size", cc, Q, K, V, mask);
         return false;
     }
+    sm70_d256_probe("ACCEPT: sm70 d256 kernel selected", cc, Q, K, V, mask);
     return true;
 }
 
