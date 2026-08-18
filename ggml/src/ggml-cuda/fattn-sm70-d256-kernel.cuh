@@ -846,3 +846,5 @@ void sm70_d256_splitd_dense_kernel(
         }
     }
 }
+
+}  // namespace FLASH_NAMESPACE
