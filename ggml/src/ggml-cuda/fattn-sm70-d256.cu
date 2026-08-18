@@ -43,7 +43,12 @@
 #define M_LOG2E 1.4426950408889634f
 #endif
 
-namespace {
+// NOTE: no anonymous namespace in this file. The CuTe vendor headers
+// (cute/atom/mma_traits_sm70.hpp) open their own anonymous namespaces;
+// a second anonymous namespace in this TU makes cudafe's
+// _GLOBAL__N__<hash> symbol mangling ambiguous ("reference to
+// '_GLOBAL__N__...' is ambiguous"). Helpers below are therefore plain
+// statics / file-scope constants.
 
 constexpr int SM70_D256_BLOCK_M = 64;
 constexpr int SM70_D256_D = 256;
@@ -136,15 +141,13 @@ static void sm70_d256_dequant_kv(
     }
 }
 
-bool sm70_env_disabled() {
+static bool sm70_env_disabled() {
     static const bool disabled = [] {
         const char * e = getenv("LLAMA_SM70_D256");
         return e && e[0] == '0';
     }();
     return disabled;
 }
-
-} // namespace
 
 // ------------------------------------------------------------------- public
 bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
