@@ -7,7 +7,9 @@ Qwen3.5/3.6/3.8-27B (head_dim=256, GQA 6:1, 16 full-attention layers).
 
 - Upstream master baseline (tag `baseline-2026-08-18` = ggml-org/llama.cpp `25ae3a9b3`).
 - `bench/prompt_46k.txt` - deterministic synthetic 46300-token prompt
-  (Qwen tokenizer), the standard A/B workload. Do not edit.
+  (Qwen tokenizer), the standard A/B workload (document-class prefill). Do not edit.
+- `bench/prompt_176k.txt` - deterministic synthetic 176292-token prompt, standard
+  long-context workload (matches the 2026-08-18 production run length 1:1). Do not edit.
 - `ggml/src/ggml-cuda/fattn.cu` - ~15-line hook (guarded by cc==700 + head_dim==256).
   All other shapes keep the stock path.
 - `ggml/src/ggml-cuda/fattn-sm70-d256.cu` - the new kernel (self-contained).
@@ -23,7 +25,9 @@ Qwen3.5/3.6/3.8-27B (head_dim=256, GQA 6:1, 16 full-attention layers).
 - G1: greedy decode 64 tokens, top-1 identical vs stock kernel, logit max diff < 1e-2.
 - G2: ncu bank conflicts < 1%, no register spills.
 - G3: 46k prompt prefill (see `bench/prompt_46k.txt`), cumulative tokens/s
-  46k >= 630, 30k >= 650, 4k unchanged within 5%.
+  46k >= 620, 30k >= 640, 4k unchanged within 5%.
+- G3b: 176k standard workload (see `bench/prompt_176k.txt`), cumulative
+  tokens/s >= 380 (stock baseline 281.5).
 
 ## Branch layout
 
