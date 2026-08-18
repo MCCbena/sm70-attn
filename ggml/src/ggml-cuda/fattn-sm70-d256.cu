@@ -169,7 +169,7 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (!kv_ok) {
         return false;
     }
-    if (K->nb[0] != ggml_row_size(K->type) || V->nb[0] != ggml_row_size(V->type)) {
+    if (K->nb[0] != ggml_row_size(K->type, K->ne[0]) || V->nb[0] != ggml_row_size(V->type, V->ne[0])) {
         return false;
     }
     return true;
