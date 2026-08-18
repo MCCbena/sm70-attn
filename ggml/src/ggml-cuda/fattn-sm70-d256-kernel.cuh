@@ -38,7 +38,6 @@
 #include "sm70-vendor/flash/softmax.h"
 #include "sm70-vendor/flash/mask.h"
 #include "sm70-vendor/flash/philox.cuh"
-#include "sm70-vendor/flash/flash.h"
 
 namespace FLASH_NAMESPACE {
 
