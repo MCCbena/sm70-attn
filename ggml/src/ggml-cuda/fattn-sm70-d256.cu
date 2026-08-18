@@ -253,8 +253,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
     const half * K_h2;
     const half * V_h2;
-    const int64_t k_row_stride, k_head_stride;
-    const int64_t v_row_stride, v_head_stride;
+    int64_t k_row_stride, k_head_stride;
+    int64_t v_row_stride, v_head_stride;
     if (K->type == GGML_TYPE_F16) {
         K_h2 = (const half *) K->data;
         k_row_stride   = K->nb[1] / sizeof(half);
