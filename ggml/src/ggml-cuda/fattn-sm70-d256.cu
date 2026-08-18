@@ -1,40 +1,336 @@
-// SPDX-FileCopyrightText: Copyright 2026-2026 the llama.cpp authors
+// SPDX-FileCopyrightText: Copyright 2026 the llama.cpp authors
 // SPDX-License-Identifier: MIT
 //
-// sm70-attn: SM70 (Volta) D256 FlashAttention kernel for Qwen3.8-27B.
+// sm70-attn plugin — commit B (path A): real SM70 D256 Split-D kernel.
 //
-// v1.0 (commit A): thin hook that routes (SM70 + D256 + prefill) to the exact
-//   stock kernel shape the prefill path runs today:
-//     get_best_fattn_kernel -> volta branch -> MMA_F16
-//     mma_f16_switch_ncols2<256,256> (Volta, GQA6: gqa_ratio%2==0) -> ncols2=2
-//     mma_f16_switch_ncols1<256,256,2>: ne[1]>16 -> case <256,256,32,2>
-//   (ncols = 32*2 = 64 Q rows/tile, 128 threads, nbatch_fa=32, Q_in_reg=true).
-//   This validates the full plugin pipeline (enum / alloc / dequant /
-//   launcher / hook condition) with zero kernel change, so G1 (numeric) is
-//   guaranteed to pass — it runs the very same kernel the stock build runs.
+// The device kernel is the 1CatAI-verified Split-D N32 flash attention
+// (provenance in fattn-sm70-d256-kernel.cuh; 1Cat-vLLM v1.3.0). The
+// verified core (smem layouts / HMMA.884 atoms / K-V pipeline / online
+// softmax / causal mask) is byte-identical to upstream. Kernel edits:
+// one extra `kv_offset` parameter (causal boundary for padded Q) + the
+// Mask construction using it. All adaptation lives in this file.
 //
-// Why stock is slow here (design target for v1.1): the config (256,256,ncols>=32)
-// uses Q_in_reg=true with nbatch_fa=32 on a 128-thread block. The full-DV f16
-// PV accumulators (T_C_VKQ x DV/16 fragments) + KQ_C + Q_B fragments push the
-// per-thread register count past the 255 limit, so the kernel spills. This is
-// the structural cause of the measured 15.8 TFLOPS (13% of peak) and matches
-// the upstream "TODO tune specifically for Volta" (fattn-mma-f16.cuh L123).
-//
-// v1.1 (commit B, next): bespoke Split-D kernel replacing this extern call:
-//   - 4 warps in 2 pairs; each pair shares the QK KQ accumulator (f32)
-//   - PV split across D: each warp owns 128 of the 256 output dims
-//     -> per-thread PV accumulator 128-dim instead of 256-dim, kills the spill
-//   - d-chunk (4x64) K/V double-buffered pipeline (LDG->smem; no cp.async on Volta)
-//
-// Rollback: LLAMA_SM70_D256=0 env var disables the hook (recompile-free).
-// Target shape: (SM70, head_dim=256, f16 KV, causal mask, prefill ne01>=256).
+// Design record: p1b-design-final.md. Key points:
+//   * Scale: stock pre-multiplies Q by `scale` (natural-log domain); the
+//     1Cat kernel keeps Q unscaled and folds the scale into exp2 via
+//     softmax_scale_log2 = scale*log2(e). Mathematically identical.
+//   * Q: staged f32->f16 into a 64-row-padded scratch (the kernel's tiled
+//     Q copy is unguarded, so the last partial Q tile MUST be padded; pad
+//     rows are zero and their outputs are never written back by the scatter).
+//   * K/V: read directly from the stock f16 buffers — native f16 cache, or
+//     the stock f16 dequant extra (this launcher runs the same to_fp16
+//     dequant the stock launch_fattn does). No K/V staging: the kernel's
+//     causal n_block_max bound + causal mask guarantee no read beyond
+//     kv_len (only the causal diagonal block is read unguarded, and all
+//     its columns are < kv_len), and the f16 buffers are physically
+//     larger than kv_len*256.
+//   * Causal: derived from positions (col > kv_offset + row); kv_offset =
+//     kv_len - q_len passed explicitly (padded Q would break the kernel's
+//     own derivation). No mask tensor consumed.
+//   * GQA: kernel grid.z = hkv*gqa (head_q = j*gqa + c); the kernel maps
+//     head_q -> head_kv. Q staging/scatter map head_q -> (b, j, c):
+//     c = Q head within the KV group (Q data depends only on c),
+//     j = KV head (K/V select), b = sequence.
+//   * Scratch layout: [hkv][gqa][nb][rows][256] f16, slice(j,c) at
+//     (j*gqa + c) * nb * rows * 256; seq b at b * rows * 256 inside.
+//   * Rollback: env LLAMA_SM70_D256=0 forces the stock path.
 
 #include "common.cuh"
 #include "fattn-common.cuh"
-#include "fattn-mma-f16.cuh"   // provides the mma_f16_case<> template + explicit instantiations
+#include "fattn-sm70-d256-kernel.cuh"
+
+#ifndef M_LOG2E
+#define M_LOG2E 1.4426950408889634f
+#endif
+
+namespace {
+
+constexpr int SM70_D256_BLOCK_M = 64;
+constexpr int SM70_D256_D = 256;
+
+// Q f32 -> f16 staging.
+// grid = (q_pad, nb*hkv, gqa); block = 128 (float2 grain over the 256 row).
+// dst (Qs) layout: [hkv][gqa][nb][q_pad][256] f16.
+__global__ void sm70_d256_stage_q_kernel(
+        const float2 * __restrict__ src, half2 * __restrict__ dst,
+        const int q_len, const int hkv, const int gqa, const int nb,
+        const int64_t src_row, const int64_t src_head, const int64_t src_seq) {
+    const int r  = blockIdx.x;
+    const int bj = blockIdx.y;          // b*hkv + j
+    const int c  = blockIdx.z;          // Q head within the KV group
+    if (r >= q_len) {
+        return;                         // pad rows: pre-zeroed scratch
+    }
+    const int j = bj % hkv;
+    const int b = bj / hkv;
+    const float2 v = src[threadIdx.x
+                   + (int64_t) r * src_row
+                   + (int64_t) c * src_head
+                   + (int64_t) b * src_seq];
+    dst[threadIdx.x
+      + (int64_t) ((int64_t) j * gqa + c) * (int64_t) nb * (gridDim.x * 128)
+      + (int64_t) b * (gridDim.x * 128)
+      + (int64_t) r * 128] = __float22half2_rn(v);
+}
+
+// Output scatter: staged [hkv][gqa][nb][rows][256] f16 -> stock f32 dst.
+// grid = (q_len, nb*hkv, gqa); block = 128.
+__global__ void sm70_d256_scatter_kernel(
+        const half2 * __restrict__ src, float2 * __restrict__ dst,
+        const int hkv, const int gqa, const int nb,
+        const int64_t dst_row, const int64_t dst_head, const int64_t dst_seq) {
+    const int r  = blockIdx.x;
+    const int bj = blockIdx.y;
+    const int c  = blockIdx.z;
+    const int j  = bj % hkv;
+    const int b  = bj / hkv;
+    const half2 v = src[threadIdx.x
+        + (int64_t) ((int64_t) j * gqa + c) * (int64_t) nb * (gridDim.x * 128)
+        + (int64_t) b * (gridDim.x * 128)
+        + (int64_t) r * 128];
+    float2 o;
+    o.x = __low2float(v);
+    o.y = __high2float(v);
+    dst[threadIdx.x
+      + (int64_t) r * dst_row
+      + (int64_t) c * dst_head
+      + (int64_t) b * dst_seq] = o;
+}
+
+// dequant K/V (q4_0 / f32) into the stock f16 extra buffers — same code
+// path (to_fp16 / to_fp16_nc) as the stock launch_fattn.
+static void sm70_d256_dequant_kv(
+        ggml_tensor * K, ggml_tensor * V,
+        const ggml_cuda_flash_attn_ext_f16_extra_data & f16_extra,
+        const bool V_is_K_view, cudaStream_t stream) {
+    if (K->type != GGML_TYPE_F16) {
+        const char * K_data = (const char *) K->data;
+        half * K_f16 = (half *) f16_extra.K;
+        GGML_ASSERT(f16_extra.K != 0);
+        if (ggml_is_contiguously_allocated(K)) {
+            const size_t bs = ggml_blck_size(K->type);
+            const size_t ts = ggml_type_size(K->type);
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            to_fp16(K_data, K_f16, ggml_nelements(K), stream);
+        } else {
+            const size_t bs = ggml_blck_size(K->type);
+            const size_t ts = ggml_type_size(K->type);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+                    K->nb[1] / ts, K->nb[2] / ts, K->nb[3] / ts, stream);
+        }
+    }
+    if (!V_is_K_view && V->type != GGML_TYPE_F16) {
+        const char * V_data = (const char *) V->data;
+        half * V_f16 = (half *) f16_extra.V;
+        GGML_ASSERT(f16_extra.V != 0);
+        if (ggml_is_contiguously_allocated(V)) {
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+            to_fp16(V_data, V_f16, ggml_nelements(V), stream);
+        } else {
+            const size_t ts = ggml_type_size(V->type);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+            to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3],
+                    V->nb[1] / ts, V->nb[2] / ts, V->nb[3] / ts, stream);
+        }
+    }
+}
+
+bool sm70_env_disabled() {
+    static const bool disabled = [] {
+        const char * e = getenv("LLAMA_SM70_D256");
+        return e && e[0] == '0';
+    }();
+    return disabled;
+}
+
+} // namespace
+
+// ------------------------------------------------------------------- public
+bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
+    if (cc != GGML_CUDA_CC_VOLTA || sm70_env_disabled()) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    if (Q->ne[0] != SM70_D256_D || K->ne[0] != SM70_D256_D || V->ne[0] != SM70_D256_D) {
+        return false;
+    }
+    if (!mask || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
+        return false;
+    }
+    if (Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    const bool kv_ok = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_Q4_0)
+                    && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32 || V->type == GGML_TYPE_Q4_0);
+    if (!kv_ok) {
+        return false;
+    }
+    if (K->nb[0] != ggml_row_size(K->type) || V->nb[0] != ggml_row_size(V->type)) {
+        return false;
+    }
+    return true;
+}
+
+// scratch (all carved from the get_alloc_size extra region after dst->data,
+// the stock f16_extra model): [K dequant][V dequant] (f16_extra layout) +
+// Qs (padded f16 Q) + Os (f16 output staging).
+size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool need_f16_K = K->type != GGML_TYPE_F16;
+    const bool need_f16_V = !V_is_K_view && V->type != GGML_TYPE_F16;
+
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+    size_t dequant = (size_t) (f16_extra.end - (uintptr_t) dst->data);
+
+    const int q_pad = (((int) Q->ne[1] + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
+    const int64_t nQ = (int64_t) Q->ne[2] * q_pad * SM70_D256_D * (int) Q->ne[3]; // f16 elems
+    dequant = GGML_PAD(dequant, 128);
+    dequant += (size_t) (2 * nQ) * sizeof(half);   // Qs + Os
+    return dequant;
+}
 
 void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    // v1.0: exact stock shape for D256/GQA6/Volta prefill — validates the pipeline.
-    // v1.1: this body becomes the bespoke Split-D SM70 D256 kernel launch.
-    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>(ctx, dst);
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    GGML_ASSERT(cc == GGML_CUDA_CC_VOLTA);
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const int hkv    = (int) K->ne[2];
+    const int gqa    = (int) (Q->ne[2] / K->ne[2]);
+    const int q_len  = (int) Q->ne[1];
+    const int kv_len = (int) K->ne[1];
+    const int nb     = (int) Q->ne[3];
+    GGML_ASSERT(Q->ne[1] == K->ne[1]);
+    GGML_ASSERT(K->type == V->type);
+
+    const int q_pad = ((q_len + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(logit_softcap == 0.0f);
+    const float softmax_scale_log2 = scale * M_LOG2E;
+    const int kv_offset = kv_len - q_len;
+
+    const int64_t nQ = (int64_t) hkv * gqa * nb * q_pad * SM70_D256_D; // f16 elems
+
+    // ------------------------------------- scratch layout (extra region)
+    // base = start of the get_alloc_size extra region (right after dst out)
+    const char * base = (const char *) dst->data + ggml_nbytes(dst);
+
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst,
+            K->type != GGML_TYPE_F16,
+            !(V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs))
+              && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16);
+
+    size_t dequant_bytes = (size_t) (f16_extra.end - (uintptr_t) dst->data);
+    dequant_bytes = GGML_PAD(dequant_bytes, 128);
+    char * Qs_bytes = (char *) base + dequant_bytes;
+    half * Qs = (half *) Qs_bytes;
+    half * Os = (half *) (Qs_bytes + (size_t) nQ * sizeof(half));
+
+    // zero pad rows of Qs (their outputs are never scattered back) and all of Os
+    CUDA_CHECK(cudaMemsetAsync((void *) Qs_bytes, 0, (size_t) 2 * nQ * sizeof(half), ctx.stream()));
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+
+    cudaStream_t stream = ctx.stream();
+    sm70_d256_dequant_kv((ggml_tensor *) K, (ggml_tensor *) V, f16_extra, V_is_K_view, stream);
+
+    const half * K_h2;
+    const half * V_h2;
+    const int64_t k_row_stride, k_head_stride;
+    const int64_t v_row_stride, v_head_stride;
+    if (K->type == GGML_TYPE_F16) {
+        K_h2 = (const half *) K->data;
+        k_row_stride   = K->nb[1] / sizeof(half);
+        k_head_stride  = K->nb[2] / sizeof(half);
+    } else {
+        K_h2 = (const half *) f16_extra.K;
+        k_row_stride   = K->ne[0];          // contiguous dequant buffer
+        k_head_stride  = (int64_t) K->ne[1] * K->ne[0];
+    }
+    if (V_is_K_view) {
+        V_h2 = K_h2;
+        v_row_stride  = k_row_stride;
+        v_head_stride = k_head_stride;
+    } else if (V->type == GGML_TYPE_F16) {
+        V_h2 = (const half *) V->data;
+        v_row_stride   = V->nb[1] / sizeof(half);
+        v_head_stride  = V->nb[2] / sizeof(half);
+    } else {
+        V_h2 = (const half *) f16_extra.V;
+        v_row_stride   = V->ne[0];
+        v_head_stride  = (int64_t) V->ne[1] * V->ne[0];
+    }
+
+    // ------------------------------------------------------ stage Q (f32->f16)
+    {
+        const dim3 grid(q_pad, nb * hkv, gqa);
+        sm70_d256_stage_q_kernel<<<grid, 128, 0, stream>>>(
+            (const float2 *) Q->data, (half2 *) Qs, q_len, hkv, gqa, nb,
+            Q->nb[1] / 8, Q->nb[2] / 8, Q->nb[3] / 8);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // ------------------------------------------------------------- attention
+    using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
+    using El = cutlass::half_t;
+    auto kernel = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
+
+    static bool smem_raised = false;
+    if (!smem_raised) {
+        CUDA_CHECK(cudaFuncSetAttribute((const void *) kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+        smem_raised = true;
+    }
+
+    const dim3 block(Traits::kNThreads);
+    const dim3 grid(q_pad / SM70_D256_BLOCK_M, nb, hkv * gqa);
+
+    kernel<<<grid, block, Traits::kSmemBytes, stream>>>(
+            (const El *) Qs,
+            (const El *) K_h2,
+            (const El *) V_h2,
+            (El *) Os,
+            /*q_batch_stride*/ (int64_t) (hkv * gqa) * nb * q_pad * SM70_D256_D,
+            /*q_row_stride  */ SM70_D256_D,
+            /*q_head_stride */ (int64_t) nb * q_pad * SM70_D256_D,
+            /*k_outer_stride*/ 0,
+            /*k_row_stride  */ (int) k_row_stride,
+            /*k_head_stride */ (int) k_head_stride,
+            /*v_outer_stride*/ 0,
+            /*v_row_stride  */ (int) v_row_stride,
+            /*v_head_stride */ (int) v_head_stride,
+            q_pad,
+            kv_len,
+            hkv * gqa,   // heads_q
+            hkv,         // heads_kv
+            kv_offset,
+            softmax_scale_log2,
+            nullptr, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
+
+    // ------------------------------------------------------------- scatter
+    {
+        const dim3 grid(q_len, nb * hkv, gqa);
+        sm70_d256_scatter_kernel<<<grid, 128, 0, stream>>>(
+            (const half2 *) Os, (float2 *) dst->data, hkv, gqa, nb,
+            Q->nb[1] / 8, Q->nb[2] / 8, Q->nb[3] / 8);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }

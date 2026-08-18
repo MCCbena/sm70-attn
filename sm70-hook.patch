@@ -1,0 +1,159 @@
+From fe7a3e7ca7a90a7975a4915ff36b8f80f8144142 Mon Sep 17 00:00:00 2001
+From: fishlikeX <fishlikeX@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 23:12:26 +0800
+Subject: [PATCH] sm70-attn v1.0: SM70 D256 prefill hook (pipeline validation,
+ stock kernel)
+
+Routes (SM70 + head_dim 256 + causal mask + prefill ne01>=256) to a new
+BEST_FATTN_KERNEL_SM70_D256 enum value, dispatched in fattn-sm70-d256.cu.
+
+v1.0 calls the exact stock mma_f16_case<256,256,32,2> shape that the
+prefill path runs today, so this commit validates the full plugin pipeline
+(enum / alloc / dequant / launcher / hook condition) with zero kernel
+change. G1 (numeric) is guaranteed to pass.
+
+Rollback: LLAMA_SM70_D256=0 (recompile-free).
+
+Next: v1.1 replaces the extern call with a bespoke Split-D SM70 D256
+kernel (4 warps in 2 pairs, shared QK KQ accumulator, PV split across D
+128/256 per warp to eliminate register spill, d-chunk double buffering).
+---
+ ggml/src/ggml-cuda/fattn-sm70-d256.cu | 40 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/fattn.cu           | 44 +++++++++++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/fattn-sm70-d256.cu
+
+diff --git a/ggml/src/ggml-cuda/fattn-sm70-d256.cu b/ggml/src/ggml-cuda/fattn-sm70-d256.cu
+new file mode 100644
+index 000000000..4560ff050
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-sm70-d256.cu
+@@ -0,0 +1,40 @@
++// SPDX-FileCopyrightText: Copyright 2026-2026 the llama.cpp authors
++// SPDX-License-Identifier: MIT
++//
++// sm70-attn: SM70 (Volta) D256 FlashAttention kernel for Qwen3.8-27B.
++//
++// v1.0 (commit A): thin hook that routes (SM70 + D256 + prefill) to the exact
++//   stock kernel shape the prefill path runs today:
++//     get_best_fattn_kernel -> volta branch -> MMA_F16
++//     mma_f16_switch_ncols2<256,256> (Volta, GQA6: gqa_ratio%2==0) -> ncols2=2
++//     mma_f16_switch_ncols1<256,256,2>: ne[1]>16 -> case <256,256,32,2>
++//   (ncols = 32*2 = 64 Q rows/tile, 128 threads, nbatch_fa=32, Q_in_reg=true).
++//   This validates the full plugin pipeline (enum / alloc / dequant /
++//   launcher / hook condition) with zero kernel change, so G1 (numeric) is
++//   guaranteed to pass — it runs the very same kernel the stock build runs.
++//
++// Why stock is slow here (design target for v1.1): the config (256,256,ncols>=32)
++// uses Q_in_reg=true with nbatch_fa=32 on a 128-thread block. The full-DV f16
++// PV accumulators (T_C_VKQ x DV/16 fragments) + KQ_C + Q_B fragments push the
++// per-thread register count past the 255 limit, so the kernel spills. This is
++// the structural cause of the measured 15.8 TFLOPS (13% of peak) and matches
++// the upstream "TODO tune specifically for Volta" (fattn-mma-f16.cuh L123).
++//
++// v1.1 (commit B, next): bespoke Split-D kernel replacing this extern call:
++//   - 4 warps in 2 pairs; each pair shares the QK KQ accumulator (f32)
++//   - PV split across D: each warp owns 128 of the 256 output dims
++//     -> per-thread PV accumulator 128-dim instead of 256-dim, kills the spill
++//   - d-chunk (4x64) K/V double-buffered pipeline (LDG->smem; no cp.async on Volta)
++//
++// Rollback: LLAMA_SM70_D256=0 env var disables the hook (recompile-free).
++// Target shape: (SM70, head_dim=256, f16 KV, causal mask, prefill ne01>=256).
++
++#include "common.cuh"
++#include "fattn-common.cuh"
++#include "fattn-mma-f16.cuh"   // provides the mma_f16_case<> template + explicit instantiations
++
++void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    // v1.0: exact stock shape for D256/GQA6/Volta prefill — validates the pipeline.
++    // v1.1: this body becomes the bespoke Split-D SM70 D256 kernel launch.
++    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>(ctx, dst);
++}
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ab7a3b297..ab6bdb408 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -5,6 +5,11 @@
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
+ 
++// sm70-attn plugin (v1.0): SM70 D256 prefill routed through fattn-sm70-d256.cu.
++// (The template definition lives in fattn-mma-f16.cuh; explicit instantiations
++//  at its tail — mma_f16_case is called directly from that .cu file.)
++extern void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ template <int DKQ, int DV, int ncols2>
+ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -333,8 +338,39 @@ enum best_fattn_kernel {
+     BEST_FATTN_KERNEL_TILE    = 200,
+     BEST_FATTN_KERNEL_VEC     = 100,
+     BEST_FATTN_KERNEL_MMA_F16 = 400,
++    BEST_FATTN_KERNEL_SM70_D256 = 500, // sm70-attn plugin (fattn-sm70-d256.cu)
+ };
+ 
++// sm70-attn plugin: route (SM70 + D256 + causal mask + prefill) to the SM70 D256 kernel.
++// Target shape: Qwen3.8-27B (head_dim 256, GQA 6:1, f16 KV via -ctk q4_0 -ctv f16 dequant).
++// Rollback: LLAMA_SM70_D256=0 (recompile-free).
++static bool sm70_d256_supported(const int cc, const ggml_tensor * dst) {
++    if (cc != GGML_CUDA_CC_VOLTA) {
++        return false;
++    }
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    if (Q->ne[0] != 256 || V->ne[0] != 256) {
++        return false;
++    }
++    if (!mask || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches stay on stock
++        return false;
++    }
++    float max_bias = 0.0f;
++    float logit_softcap = 0.0f;
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    if (max_bias != 0.0f || logit_softcap != 0.0f) {
++        return false;
++    }
++    const char * env = getenv("LLAMA_SM70_D256");
++    if (env && atoi(env) == 0) {
++        return false;
++    }
++    return true;
++}
++
+ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_F32:
+@@ -489,6 +525,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     }
+ 
+     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
++        // sm70-attn hook: D256 prefill on SM70 -> bespoke kernel (see fattn-sm70-d256.cu).
++        if (sm70_d256_supported(cc, dst)) {
++            return BEST_FATTN_KERNEL_SM70_D256;
++        }
+         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+             return BEST_FATTN_KERNEL_VEC;
+         }
+@@ -550,6 +590,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     switch (kernel) {
+         case BEST_FATTN_KERNEL_TILE:
+         case BEST_FATTN_KERNEL_MMA_F16:
++        case BEST_FATTN_KERNEL_SM70_D256: // same f16 K/V dequant requirement as MMA_F16
+             need_f16_K = true;
+             need_f16_V = true;
+             break;
+@@ -581,6 +622,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         case BEST_FATTN_KERNEL_MMA_F16:
+             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+             break;
++        case BEST_FATTN_KERNEL_SM70_D256:
++            ggml_cuda_flash_attn_ext_sm70_d256(ctx, dst);
++            break;
+     }
+ }
+ 
+-- 
+2.53.0.windows.1
+
