@@ -181,8 +181,15 @@ static void sm70_d256_probe(const char * reason, int cc,
     // carry the full view and are built before any request arrives.
     // Edge: a chunk that actually fills the cache (kv_len == capacity)
     // is mislabelled ph - probe only, no functional impact.
+    // NOTE (8/20 post-mortem): draft-model templates (head_dim != 256,
+    // q_len = 512) were mislabelled REAL and consumed the 5 real# budget
+    // slots at load, permanently silencing the probe for target-model
+    // prefill afterwards. Draft dispatch is uninteresting for this
+    // probe (the kernel only ever runs for head_dim == 256), so classify
+    // those as ph.
     static int64_t kv_max_seen = 0;
-    const bool real = Q->ne[1] >= 256 && kv_max_seen > 0 && K->ne[1] < kv_max_seen;
+    const bool real = Q->ne[0] == SM70_D256_D && Q->ne[1] >= 256
+                      && kv_max_seen > 0 && K->ne[1] < kv_max_seen;
     if (K->ne[1] > kv_max_seen) { kv_max_seen = K->ne[1]; }
     static int printed_ph = 0;
     static int printed_real = 0;
