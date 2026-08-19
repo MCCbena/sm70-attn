@@ -156,15 +156,14 @@ static void sm70_d256_probe(const char * reason, int cc,
                             const ggml_tensor * Q, const ggml_tensor * K,
                             const ggml_tensor * V, const ggml_tensor * mask) {
     static const bool verbose = getenv("LLAMA_SM70_D256_DEBUG") != nullptr;
-    static bool first = true;
-    if (!verbose && !first) {
+    static int printed = 0;
+    if (!verbose && printed >= 20) {
         return;
     }
-    first = false;
-    fprintf(stderr, "[sm70-d256] %s | cc=%d Q=(%lld,%lld,%lld,%lld) Qtype=%d "
+    fprintf(stderr, "[sm70-d256] #%d %s | cc=%d Q=(%lld,%lld,%lld,%lld) Qtype=%d "
             "K=(%lld,%lld,%lld,%lld) Ktype=%d Knb0=%llu rowK=%llu "
             "Vtype=%d Vnb0=%llu rowV=%llu mask=%p\n",
-            reason, cc,
+            ++printed, reason, cc,
             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], (int) Q->type,
             (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], (int) K->type,
             (unsigned long long) K->nb[0], (unsigned long long) ggml_row_size(K->type, K->ne[0]),
