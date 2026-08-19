@@ -166,13 +166,15 @@ static void sm70_d256_probe(const char * reason, int cc,
                             const ggml_tensor * Q, const ggml_tensor * K,
                             const ggml_tensor * V, const ggml_tensor * mask) {
     static const bool verbose = getenv("LLAMA_SM70_D256_DEBUG") != nullptr;
-    // Two budgets: build-time placeholder calls (mask spans the FULL cache)
-    // and "real" calls (mask->ne[0] < cache size = actual KV length).
-    // Without the split, the startup placeholders exhaust the budget and
-    // the first real prefill (the interesting one) prints nothing.
+    // Two budgets: startup placeholder calls (graph build / decode, q_len < 256)
+    // and "real" prefill dispatches (q_len >= 256 = the kernel's entry gate).
+    // NB (8/19 46k post-mortem): K->ne[1] is a DYNAMIC view == current kv_len
+    // in every case (placeholders included), so mask->ne[0] < K->ne[1] was
+    // never true and every line printed as ph#. q_len is the discriminator:
+    // placeholders are q_len 1/16/3, real chunks are 512.
     static int printed_ph = 0;
     static int printed_real = 0;
-    const bool real = mask && mask->ne[0] < K->ne[1];
+    const bool real = Q->ne[1] >= 256;
     if (!verbose && (real ? printed_real >= 5 : printed_ph >= 20)) {
         return;
     }
