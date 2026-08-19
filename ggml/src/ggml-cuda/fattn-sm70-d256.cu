@@ -166,15 +166,26 @@ static void sm70_d256_probe(const char * reason, int cc,
                             const ggml_tensor * Q, const ggml_tensor * K,
                             const ggml_tensor * V, const ggml_tensor * mask) {
     static const bool verbose = getenv("LLAMA_SM70_D256_DEBUG") != nullptr;
-    // Two budgets: startup placeholder calls (graph build / decode, q_len < 256)
-    // and "real" prefill dispatches (q_len >= 256 = the kernel's entry gate).
-    // NB (8/19 46k post-mortem): K->ne[1] is a DYNAMIC view == current kv_len
-    // in every case (placeholders included), so mask->ne[0] < K->ne[1] was
-    // never true and every line printed as ph#. q_len is the discriminator:
-    // placeholders are q_len 1/16/3, real chunks are 512.
+    // Three classes of dispatch:
+    //  * template: graph-build placeholders (any q_len incl. the 512-batch
+    //    template; KV/mask views carry the FULL cache capacity)
+    //  * real: actual prefill chunk (q_len >= 256, KV view sliced to the
+    //    current kv_len < capacity)
+    //  * ph: everything else (decode, MTP, small templates)
+    // NB (8/19 46k post-mortem #2): K->ne[1] is the VIEW size, not the
+    // capacity - real chunks are sliced to kv_len, so mask->ne[0] < K->ne[1]
+    // is never true; and the build-time 512-batch template has q_len=512
+    // with the full view, so q_len alone cannot separate it from real
+    // chunks (it consumed real#1-5 with Mkv==capacity). Capacity = the
+    // largest K->ne[1] ever observed: load templates (q=1/16/3/512) all
+    // carry the full view and are built before any request arrives.
+    // Edge: a chunk that actually fills the cache (kv_len == capacity)
+    // is mislabelled ph - probe only, no functional impact.
+    static int64_t kv_max_seen = 0;
+    const bool real = Q->ne[1] >= 256 && kv_max_seen > 0 && K->ne[1] < kv_max_seen;
+    if (K->ne[1] > kv_max_seen) { kv_max_seen = K->ne[1]; }
     static int printed_ph = 0;
     static int printed_real = 0;
-    const bool real = Q->ne[1] >= 256;
     if (!verbose && (real ? printed_real >= 5 : printed_ph >= 20)) {
         return;
     }
