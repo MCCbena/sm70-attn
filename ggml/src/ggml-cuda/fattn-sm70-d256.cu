@@ -256,17 +256,19 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
     const bool need_f16_K = K->type != GGML_TYPE_F16;
-    const bool need_f16_V = !V_is_K_view && V->type != GGML_TYPE_F16;
+    // MUST match the launcher's need_f16_V exactly (edge case: V is a view of
+    // a non-f16 K — the launcher still dequants V, so the alloc must cover it).
+    const bool need_f16_V = !(V_is_K_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16;
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
-    size_t dequant = (size_t) (f16_extra.end - (uintptr_t) dst->data);
+    // f16_extra size = bytes beyond the output data (base = dst->data + nbytes)
+    const size_t f16_extra_size = (size_t) (f16_extra.end - ((uintptr_t) dst->data + ggml_nbytes(dst)));
 
     const int q_pad = (((int) Q->ne[1] + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
     const int64_t nQ = (int64_t) Q->ne[2] * q_pad * SM70_D256_D * (int) Q->ne[3]; // f16 elems
-    dequant = GGML_PAD(dequant, 128);
-    dequant += (size_t) (2 * nQ) * sizeof(half);   // Qs + Os
-    return dequant;
+    // total allocation = output + PAD(f16_extra, 128) + Qs + Os
+    return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128) + (size_t) (2 * nQ) * sizeof(half);
 }
 
 void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -313,7 +315,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             !(V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs))
               && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16);
 
-    size_t dequant_bytes = (size_t) (f16_extra.end - (uintptr_t) dst->data);
+    size_t dequant_bytes = (size_t) (f16_extra.end - (uintptr_t) base);  // f16_extra region only (NOT incl. output data)
     dequant_bytes = GGML_PAD(dequant_bytes, 128);
     char * Qs_bytes = (char *) base + dequant_bytes;
     half * Qs = (half *) Qs_bytes;
