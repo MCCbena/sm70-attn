@@ -166,14 +166,22 @@ static void sm70_d256_probe(const char * reason, int cc,
                             const ggml_tensor * Q, const ggml_tensor * K,
                             const ggml_tensor * V, const ggml_tensor * mask) {
     static const bool verbose = getenv("LLAMA_SM70_D256_DEBUG") != nullptr;
-    static int printed = 0;
-    if (!verbose && printed >= 20) {
+    // Two budgets: build-time placeholder calls (mask spans the FULL cache)
+    // and "real" calls (mask->ne[0] < cache size = actual KV length).
+    // Without the split, the startup placeholders exhaust the budget and
+    // the first real prefill (the interesting one) prints nothing.
+    static int printed_ph = 0;
+    static int printed_real = 0;
+    const bool real = mask && mask->ne[0] < K->ne[1];
+    if (!verbose && (real ? printed_real >= 5 : printed_ph >= 20)) {
         return;
     }
-    fprintf(stderr, "[sm70-d256] #%d %s | cc=%d Q=(%lld,%lld,%lld,%lld) Qtype=%d "
+    if (real) { printed_real++; } else { printed_ph++; }
+    int n = (real ? printed_real : printed_ph);
+    fprintf(stderr, "[sm70-d256] %s#%d %s | cc=%d Q=(%lld,%lld,%lld,%lld) Qtype=%d "
             "K=(%lld,%lld,%lld,%lld) Ktype=%d Knb0=%llu Knb1=%llu Knb2=%llu rowK=%llu "
             "Vtype=%d Vnb0=%llu Vnb1=%llu Vnb2=%llu rowV=%llu Mkv=%lld mask=%p\n",
-            ++printed, reason, cc,
+            (real ? "real" : "ph"), n, reason, cc,
             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], (int) Q->type,
             (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], (int) K->type,
             (unsigned long long) K->nb[0], (unsigned long long) K->nb[1], (unsigned long long) K->nb[2], (unsigned long long) ggml_row_size(K->type, K->ne[0]),
