@@ -278,7 +278,11 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const int kv_len = (int) mask->ne[0];
     const int nb     = (int) Q->ne[3];
     GGML_ASSERT(mask != nullptr);
-    GGML_ASSERT(K->type == V->type);
+    // NOTE (8/19 crash post-mortem): K and V types are legitimately
+    // different (-ctk q4_0 -ctv f16): the dequant path handles each
+    // independently. Do NOT assert K->type == V->type.
+    GGML_ASSERT(K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0);
 
     const int q_pad = ((q_len + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
 
@@ -371,9 +375,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             (const El *) K_h2,
             (const El *) V_h2,
             (El *) Os,
-            /*q_batch_stride*/ (int64_t) (hkv * gqa) * nb * q_pad * SM70_D256_D,
+            /*q_batch_stride*/ (int64_t) (hkv * gqa) * q_pad * SM70_D256_D,  // Qs: [b][head_q][row][d]
             /*q_row_stride  */ SM70_D256_D,
-            /*q_head_stride */ (int64_t) nb * q_pad * SM70_D256_D,
+            /*q_head_stride */ (int64_t) q_pad * SM70_D256_D,
             /*k_outer_stride*/ 0,
             /*k_row_stride  */ (int) k_row_stride,
             /*k_head_stride */ (int) k_head_stride,
