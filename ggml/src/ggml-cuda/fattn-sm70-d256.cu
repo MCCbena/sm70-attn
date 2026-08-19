@@ -161,13 +161,13 @@ static void sm70_d256_probe(const char * reason, int cc,
         return;
     }
     fprintf(stderr, "[sm70-d256] #%d %s | cc=%d Q=(%lld,%lld,%lld,%lld) Qtype=%d "
-            "K=(%lld,%lld,%lld,%lld) Ktype=%d Knb0=%llu rowK=%llu "
-            "Vtype=%d Vnb0=%llu rowV=%llu mask=%p\n",
+            "K=(%lld,%lld,%lld,%lld) Ktype=%d Knb1=%llu Knb2=%llu rowK=%llu "
+            "Vtype=%d Vnb1=%llu Vnb2=%llu rowV=%llu mask=%p\n",
             ++printed, reason, cc,
             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], (int) Q->type,
             (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], (int) K->type,
-            (unsigned long long) K->nb[0], (unsigned long long) ggml_row_size(K->type, K->ne[0]),
-            (int) V->type, (unsigned long long) V->nb[0], (unsigned long long) ggml_row_size(V->type, V->ne[0]),
+            (unsigned long long) K->nb[1], (unsigned long long) K->nb[2], (unsigned long long) ggml_row_size(K->type, K->ne[0]),
+            (int) V->type, (unsigned long long) V->nb[1], (unsigned long long) V->nb[2], (unsigned long long) ggml_row_size(V->type, V->ne[0]),
             (const void *) mask);
 }
 
@@ -206,8 +206,13 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: kv type", cc, Q, K, V, mask);
         return false;
     }
-    if (K->nb[0] != ggml_row_size(K->type, K->ne[0]) || V->nb[0] != ggml_row_size(V->type, V->ne[0])) {
-        sm70_d256_probe("REJECT: nb0 != row_size", cc, Q, K, V, mask);
+    // NB: ggml nb[0] = bytes per ELEMENT (2 for F16); row stride is nb[1].
+    // Dequant path needs fully contiguous K/V; f16-direct path honors nb[] strides,
+    // so gate on row-contiguity + head-contiguity (sufficient for both).
+    const bool k_contig = K->nb[1] == ggml_row_size(K->type, K->ne[0]) && K->nb[2] == K->nb[1] * K->ne[1];
+    const bool v_contig = V->nb[1] == ggml_row_size(V->type, V->ne[0]) && V->nb[2] == V->nb[1] * V->ne[1];
+    if (!k_contig || !v_contig) {
+        sm70_d256_probe("REJECT: K/V not contiguous", cc, Q, K, V, mask);
         return false;
     }
     sm70_d256_probe("ACCEPT: sm70 d256 kernel selected", cc, Q, K, V, mask);
