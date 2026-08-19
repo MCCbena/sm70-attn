@@ -69,13 +69,17 @@ __global__ void sm70_d256_stage_q_kernel(
     }
     const int j = bj % hkv;
     const int b = bj / hkv;
+    const int head_q = j * gqa + c;     // GLOBAL Q head index (0..heads_q-1)
+    const int heads_q = hkv * gqa;      // 24
+    // Q source layout is (D, q_len, heads, batch): head index = head_q, NOT c.
     const float2 v = src[threadIdx.x
                    + (int64_t) r * src_row
-                   + (int64_t) c * src_head
+                   + (int64_t) head_q * src_head
                    + (int64_t) b * src_seq];
+    // Qs layout (kernel reads [b][head_q][q_pad][D]): batch-major.
     dst[threadIdx.x
-      + (int64_t) ((int64_t) j * gqa + c) * (int64_t) nb * (gridDim.x * 128)
-      + (int64_t) b * (gridDim.x * 128)
+      + (int64_t) b * heads_q * (gridDim.x * 128)
+      + (int64_t) head_q * (gridDim.x * 128)
       + (int64_t) r * 128] = __float22half2_rn(v);
 }
 
@@ -84,22 +88,28 @@ __global__ void sm70_d256_stage_q_kernel(
 __global__ void sm70_d256_scatter_kernel(
         const half2 * __restrict__ src, float2 * __restrict__ dst,
         const int hkv, const int gqa, const int nb,
+        const int q_pad,
         const int64_t dst_row, const int64_t dst_head, const int64_t dst_seq) {
     const int r  = blockIdx.x;
-    const int bj = blockIdx.y;
-    const int c  = blockIdx.z;
-    const int j  = bj % hkv;
-    const int b  = bj / hkv;
+    const int bj = blockIdx.y;          // b*hkv + j
+    const int c  = blockIdx.z;          // Q head within the KV group
+    const int j = bj % hkv;
+    const int b = bj / hkv;
+    const int head_q = j * gqa + c;     // GLOBAL Q head index (0..heads_q-1)
+    const int heads_q = hkv * gqa;      // 24
+    const int d2 = SM70_D256_D / 2;     // 128 half2 per head
+    // Os layout (kernel-hardcoded): [batch][row][head_q][D]; batch stride uses q_pad.
     const half2 v = src[threadIdx.x
-        + (int64_t) ((int64_t) j * gqa + c) * (int64_t) nb * (gridDim.x * 128)
-        + (int64_t) b * (gridDim.x * 128)
-        + (int64_t) r * 128];
+        + (int64_t) b * (int64_t) q_pad * heads_q * d2
+        + (int64_t) r * (heads_q * d2)
+        + (int64_t) head_q * d2];
     float2 o;
     o.x = __low2float(v);
     o.y = __high2float(v);
+    // dst (f32 Q layout (D, q_len, heads, batch)): row + global head_q + seq.
     dst[threadIdx.x
       + (int64_t) r * dst_row
-      + (int64_t) c * dst_head
+      + (int64_t) head_q * dst_head
       + (int64_t) b * dst_seq] = o;
 }
 
@@ -162,13 +172,13 @@ static void sm70_d256_probe(const char * reason, int cc,
     }
     fprintf(stderr, "[sm70-d256] #%d %s | cc=%d Q=(%lld,%lld,%lld,%lld) Qtype=%d "
             "K=(%lld,%lld,%lld,%lld) Ktype=%d Knb0=%llu Knb1=%llu Knb2=%llu rowK=%llu "
-            "Vtype=%d Vnb0=%llu Vnb1=%llu Vnb2=%llu rowV=%llu mask=%p\n",
+            "Vtype=%d Vnb0=%llu Vnb1=%llu Vnb2=%llu rowV=%llu Mkv=%lld mask=%p\n",
             ++printed, reason, cc,
             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], (int) Q->type,
             (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], (int) K->type,
             (unsigned long long) K->nb[0], (unsigned long long) K->nb[1], (unsigned long long) K->nb[2], (unsigned long long) ggml_row_size(K->type, K->ne[0]),
             (int) V->type, (unsigned long long) V->nb[0], (unsigned long long) V->nb[1], (unsigned long long) V->nb[2], (unsigned long long) ggml_row_size(V->type, V->ne[0]),
-            (const void *) mask);
+            mask ? (long long) mask->ne[0] : -1LL, (const void *) mask);
 }
 
 // ------------------------------------------------------------------- public
@@ -192,8 +202,12 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: head_dim != 256", cc, Q, K, V, mask);
         return false;
     }
-    if (!mask || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
-        sm70_d256_probe("REJECT: no mask or q_len < 256", cc, Q, K, V, mask);
+    if (!mask || mask->ne[0] < 256 || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
+        sm70_d256_probe("REJECT: no mask or small batch", cc, Q, K, V, mask);
+        return false;
+    }
+    if (Q->ne[1] > mask->ne[0]) { // kv_len (mask->ne[0]) must cover q_len
+        sm70_d256_probe("REJECT: kv_len < q_len", cc, Q, K, V, mask);
         return false;
     }
     if (Q->ne[2] % K->ne[2] != 0) {
@@ -259,9 +273,11 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const int hkv    = (int) K->ne[2];
     const int gqa    = (int) (Q->ne[2] / K->ne[2]);
     const int q_len  = (int) Q->ne[1];
-    const int kv_len = (int) K->ne[1];
+    const ggml_tensor * mask = dst->src[3];
+    // REAL KV length is mask->ne[0] (mask built as [n_kv, q_len]); K->ne[1] is the FULL cache size.
+    const int kv_len = (int) mask->ne[0];
     const int nb     = (int) Q->ne[3];
-    GGML_ASSERT(Q->ne[1] == K->ne[1]);
+    GGML_ASSERT(mask != nullptr);
     GGML_ASSERT(K->type == V->type);
 
     const int q_pad = ((q_len + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
@@ -273,7 +289,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     GGML_ASSERT(logit_softcap == 0.0f);
     const float softmax_scale_log2 = scale * M_LOG2E;
     const int kv_offset = kv_len - q_len;
-
     const int64_t nQ = (int64_t) hkv * gqa * nb * q_pad * SM70_D256_D; // f16 elems
 
     // ------------------------------------- scratch layout (extra region)
@@ -378,7 +393,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     {
         const dim3 grid(q_len, nb * hkv, gqa);
         sm70_d256_scatter_kernel<<<grid, 128, 0, stream>>>(
-            (const half2 *) Os, (float2 *) dst->data, hkv, gqa, nb,
+            (const half2 *) Os, (float2 *) dst->data, hkv, gqa, nb, q_pad,
             Q->nb[1] / 8, Q->nb[2] / 8, Q->nb[3] / 8);
         CUDA_CHECK(cudaGetLastError());
     }
