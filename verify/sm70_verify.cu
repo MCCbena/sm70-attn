@@ -83,7 +83,10 @@ static int run_case(const Case& tc, bool oob) {
     const int kv_offset = kvlen - q_len;
     const float scale_log2 = (1.0f / 16.0f) * 1.4426950408889634f;
 
-    // host f32 source (Q rows beyond q_len = pad = zero, per launcher memset)
+    // host f32 source (Q rows beyond q_len = pad = zero, per launcher memset).
+    // The CPU reference runs on the f16-QUANTIZED values (same bytes the
+    // kernel receives) so the only residual difference is fp32 accumulation
+    // order — not input rounding.
     std::vector<float> Qf((size_t) nb * heads_q * q_pad * D, 0.0f),
                        Kf((size_t) nb * hkv * kvlen * D),
                        Vf((size_t) nb * hkv * kvlen * D);
@@ -93,6 +96,12 @@ static int run_case(const Case& tc, bool oob) {
     for (auto& x : Kf) x = frand();
     for (auto& x : Vf) x = frand();
 
+    // f16-quantized copies = exactly what the kernel sees
+    std::vector<float> Qqf(Qf.size()), Kqf(Kf.size()), Vqf(Vf.size());
+    for (size_t i = 0; i < Qf.size(); ++i) Qqf[i] = __half2float(__float2half(Qf[i]));
+    for (size_t i = 0; i < Kf.size(); ++i) Kqf[i] = __half2float(__float2half(Kf[i]));
+    for (size_t i = 0; i < Vf.size(); ++i) Vqf[i] = __half2float(__float2half(Vf[i]));
+
     const int kv_alloc_rows = oob ? kvlen : kvlen + 3;
     std::vector<__half> Qh(Qf.size()), Kh((size_t) nb * hkv * kv_alloc_rows * D), Vh((size_t) nb * hkv * kv_alloc_rows * D);
     for (size_t i = 0; i < Qf.size(); ++i) Qh[i] = __float2half(Qf[i]);
@@ -100,14 +109,15 @@ static int run_case(const Case& tc, bool oob) {
     for (size_t i = 0; i < Vf.size(); ++i) Vh[i] = __float2half(Vf[i]);
 
     void *dQ, *dK, *dV, *dO;
+    // kernel writes O at [batch][row][head][d] with batch stride = q_pad*heads_q*D
+    // (kernel lines 841-844; scatter kernel reads the same layout)
     CK(cudaMalloc(&dQ, Qh.size() * sizeof(El)));
     CK(cudaMalloc(&dK, Kh.size() * sizeof(El)));
     CK(cudaMalloc(&dV, Vh.size() * sizeof(El)));
-    CK(cudaMalloc(&dO, (size_t) nb * heads_q * q_len * D * sizeof(El)));
+    CK(cudaMalloc(&dO, (size_t) nb * q_pad * heads_q * D * sizeof(El)));
     CK(cudaMemcpy(dQ, Qh.data(), Qh.size() * sizeof(El), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dK, Kh.data(), Kh.size() * sizeof(El), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dV, Vh.data(), Vh.size() * sizeof(El), cudaMemcpyHostToDevice));
-
     auto kernel = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
     static bool smem_raised = false;
     if (!smem_raised) {
@@ -129,7 +139,7 @@ static int run_case(const Case& tc, bool oob) {
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
-    std::vector<__half> Ohost((size_t) nb * heads_q * q_len * D);
+    std::vector<__half> Ohost((size_t) nb * q_pad * heads_q * D);
     CK(cudaMemcpy(Ohost.data(), dO, Ohost.size() * sizeof(El), cudaMemcpyDeviceToHost));
 
     // which rows/heads to check
@@ -161,15 +171,17 @@ static int run_case(const Case& tc, bool oob) {
     for (int b = 0; b < nb; ++b) {
       for (int h : heads) {
         const int hkv_idx = h / gqa;
-        const float* qbase = &Qf[((size_t) b * heads_q + h) * q_pad * D];
-        const float* kbase = &Kf[((size_t) b * hkv + hkv_idx) * kvlen * D];
-        const float* vbase = &Vf[((size_t) b * hkv + hkv_idx) * kvlen * D];
-        const __half* obase = &Ohost[((size_t) b * heads_q + h) * q_len * D];
+        const float* qbase = &Qqf[((size_t) b * heads_q + h) * q_pad * D];
+        const float* kbase = &Kqf[((size_t) b * hkv + hkv_idx) * kvlen * D];
+        const float* vbase = &Vqf[((size_t) b * hkv + hkv_idx) * kvlen * D];
+        // kernel O layout: [b][row][head][d], batch stride q_pad*heads_q*D (row stride heads_q*D)
+        const __half* obase = &Ohost[((size_t) b * q_pad * heads_q) * D];
         for (int r : rows) {
             float ref[256];
             ref_row(qbase + (size_t) r * D, kbase, vbase, kvlen, kv_offset, r, ref);
+            const __half* orow = obase + ((size_t) r * heads_q + h) * D;   // [b][row][head][d]
             for (int d = 0; d < D; ++d) {
-                const float got = __half2float(obase[(size_t) r * D + d]);
+                const float got = __half2float(orow[d]);
                 ncmp++;
                 if (std::isnan(got) || std::isinf(got)) {
                     nan_out++;
