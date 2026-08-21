@@ -105,8 +105,25 @@ static int run_case(const Case& tc, bool oob) {
     const int kv_alloc_rows = oob ? kvlen : kvlen + 3;
     std::vector<__half> Qh(Qf.size()), Kh((size_t) nb * hkv * kv_alloc_rows * D), Vh((size_t) nb * hkv * kv_alloc_rows * D);
     for (size_t i = 0; i < Qf.size(); ++i) Qh[i] = __float2half(Qf[i]);
-    for (size_t i = 0; i < Kf.size(); ++i) Kh[i] = __float2half(Kf[i]);
-    for (size_t i = 0; i < Vf.size(); ++i) Vh[i] = __float2half(Vf[i]);
+    // NOTE: per-head copy with EXPLICIT strides. A linear copy here would
+    // misalign head j by j*3 rows when kv_alloc_rows > kvlen (headroom),
+    // because device layout is [hkv][kv_alloc_rows][D] but source is [hkv][kvlen][D].
+    for (int b = 0; b < nb; ++b) for (int j = 0; j < hkv; ++j)
+        for (int c = 0; c < kv_alloc_rows; ++c)
+            for (int d = 0; d < D; ++d) {
+                const size_t dst_i = (((size_t)(b * hkv + j) * kv_alloc_rows + c) * D + d);
+                const float val = (c < kvlen)
+                    ? Kf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
+                Kh[dst_i] = __float2half(val);
+            }
+    for (int b = 0; b < nb; ++b) for (int j = 0; j < hkv; ++j)
+        for (int c = 0; c < kv_alloc_rows; ++c)
+            for (int d = 0; d < D; ++d) {
+                const size_t dst_i = (((size_t)(b * hkv + j) * kv_alloc_rows + c) * D + d);
+                const float val = (c < kvlen)
+                    ? Vf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
+                Vh[dst_i] = __float2half(val);
+            }
 
     void *dQ, *dK, *dV, *dO;
     // kernel writes O at [batch][row][head][d] with batch stride = q_pad*heads_q*D
@@ -162,9 +179,9 @@ static int run_case(const Case& tc, bool oob) {
     struct ErrRec { double e; int b, h, r, d; };
     std::vector<ErrRec> top;
     auto consider = [&](double e, int b, int h, int r, int d) {
-        if (top.size() < 5) top.push_back({e, b, h, r, d});
-        else if (e > top.back().e) {
-            top.back() = {e, b, h, r, d};
+        if (top.size() < 5 || e > top.back().e) {
+            if (top.size() < 5) top.push_back({e, b, h, r, d});
+            else top.back() = {e, b, h, r, d};
             std::sort(top.begin(), top.end(), [](const ErrRec& a, const ErrRec& b){ return a.e > b.e; });
         }
     };
