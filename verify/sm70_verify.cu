@@ -143,9 +143,13 @@ static int run_case(const Case& tc, bool oob) {
     }
     const dim3 block(Traits::kNThreads);
     const dim3 grid(q_pad / 64, nb, hkv * gqa);
-    const int64_t head_s = (int64_t) kv_alloc_rows * D;  // contiguous per batch (== launcher dequant path)
-    const int k_outer = (nb == 1) ? 0 : (int) head_s;   // nb=1: exact production value (0); nb=2: correct value
-    const int v_outer = (nb == 1) ? 0 : (int) head_s;
+    const int64_t head_s = (int64_t) kv_alloc_rows * D;  // one kv-head's rows (== launcher dequant path)
+    // nb=1: production passes outer_stride=0 (batch offset never used).
+    // nb>1: correct value = whole batch = hkv * head_s. NOTE: the production
+    // launcher hardcodes 0 here for ALL nb — that latent bug is documented
+    // separately and NOT what this harness tests.
+    const int k_outer = (nb == 1) ? 0 : (int)(hkv * head_s);
+    const int v_outer = (nb == 1) ? 0 : (int)(hkv * head_s);
 
     kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
         (const El*) dQ, (const El*) dK, (const El*) dV, (El*) dO,
