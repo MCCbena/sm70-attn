@@ -150,10 +150,14 @@ def run_phase(server, phase, turns, decode, outdir):
         prompt += chunk
         print("  turn %2d: %5d tok in %7.1fs  (%.1f tok/s)"
               % (t + 1, len(toks), secs, len(toks) / max(secs, 1e-9)), flush=True)
+        # 每轮落盘: 中途崩溃不丢已完成的轮 (上版只存结尾, turn8 后崩 = 白跑 15 分钟)
+        out["end_wall"] = time.time()
+        with open(os.path.join(outdir, "logit_ab_%s.json" % phase), "w") as f:
+            json.dump(out, f)
     out["end_wall"] = time.time()
     path = os.path.join(outdir, "logit_ab_%s.json" % phase)
     with open(path, "w") as f:
-        json.dump(out)
+        json.dump(out, f)
     print("saved ->", path)
     # 探针放在 phase 结束: 只为确认连接/形状 (输出会进 slot, 绝不能放在 phase 前)
     try:
