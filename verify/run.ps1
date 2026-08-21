@@ -11,7 +11,7 @@
 param([switch]$Full, [switch]$Oob)
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot           # .../sm70-attn/ggml/src/ggml-cuda
+$root = Join-Path (Split-Path -Parent $PSScriptRoot) "ggml\src\ggml-cuda"   # .../sm70-attn/ggml/src/ggml-cuda
 $inc  = "$root\sm70-vendor"
 
 # ---- source fingerprint guard ------------------------------------------------
@@ -27,7 +27,7 @@ Write-Host ("kernel md5 ok: " + $kmd5)
 $bin  = Join-Path $PSScriptRoot "sm70_verify.exe"
 
 Write-Host "== build =="
-& nvcc -O2 -std=c++17 -arch=sm_70 -I "$inc" sm70_verify.cu -o sm70_verify.exe
+& nvcc -O2 -std=c++17 -arch=sm_70 -I "$inc" -I "$root" "$PSScriptRoot\sm70_verify.cu" -o "$bin"
 if ($LASTEXITCODE -ne 0) { throw "nvcc build failed" }
 
 Write-Host "== device check =="
