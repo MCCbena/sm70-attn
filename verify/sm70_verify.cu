@@ -74,7 +74,8 @@ static std::vector<float> ref_row(const float* q_row, const float* k, const floa
     return pbuf;
 }
 
-struct Case { const char* name; int nb, kvlen, q_len; bool sample; };
+struct Case { const char* name; int nb, kvlen, q_len; bool sample;
+              bool v_posmajor = false; };  // true = production position-major V (v_row=hkv*D, v_head=D)
 
 static int run_case(const Case& tc, bool oob) {
     const int nb = tc.nb, kvlen = tc.kvlen, q_len = tc.q_len;
@@ -150,12 +151,29 @@ static int run_case(const Case& tc, bool oob) {
     // separately and NOT what this harness tests.
     const int k_outer = (nb == 1) ? 0 : (int)(hkv * head_s);
     const int v_outer = (nb == 1) ? 0 : (int)(hkv * head_s);
+    // V strides: harness default = head-major (v_row=D, v_head=kv_alloc_rows*D),
+    // matching production ONLY for the dequant path (V=Q4_0). Production
+    // production -ctv f16 reads the paged F16 cache DIRECTLY:
+    //   v_row_stride  = V->nb[1] (ctx stride; page = 4 ctx x 4 kvheads x 256 = 1024 for cc=700)
+    //   v_head_stride = V->nb[2] (256: cache is [ctx][head][dim], head-minor)
+    // i.e. position-major. v_posmajor=true replicates the 4-ctx-page geometry
+    // (kv_alloc_rows >= 4; page = 4*4*D, v_row = 4*D).
+    int v_row_stride, v_head_stride;
+    if (tc.v_posmajor) {
+        const int page_ctx = 4;                    // ctx per page (llama.cpp cc700)
+        const int page = page_ctx * hkv * D;       // rows per page
+        v_row_stride  = page_ctx * D;              // V->nb[1]/2 = 1024
+        v_head_stride = D;                         // V->nb[2]/2 = 256
+    } else {
+        v_row_stride  = D;
+        v_head_stride = (int) head_s;
+    }
 
     kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
         (const El*) dQ, (const El*) dK, (const El*) dV, (El*) dO,
         (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
         k_outer, D, (int) head_s,
-        v_outer, D, (int) head_s,
+        v_outer, v_row_stride, v_head_stride,
         q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
@@ -243,9 +261,12 @@ int main(int argc, char** argv) {
         { "long-3000",   1, 3000, 3000, true  },  // 94 N-blocks, sampled
         { "nb2-279",     2,  279, 279, true  },  // batch=2, sampled
         { "nb2-long",    2, 3000, 3000, true  },
+        { "posV-279",    1,  279, 279, false, true },  // production V strides (pos-major F16 direct)
+        { "posV-3000",   1, 3000, 3000, true,  true },
     };
     static const Case big[] = {
-        { "full-32k",    1, 32768, 32768, true },  // 1024 N-blocks, sampled
+        { "full-32k",    1, 32768, 32768, true },
+        { "posV-32k",    1, 32768, 32768, true,  true },  // production V strides, big
     };
 
     int fails = 0;
