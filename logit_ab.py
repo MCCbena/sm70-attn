@@ -261,6 +261,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", choices=["A", "A2", "B"])
     ap.add_argument("--compare", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="--compare 时跳过重启间隔检查")
     ap.add_argument("--server", default=DEFAULT_SERVER,
                     help="默认 http://127.0.0.1:8080, 一般不要改")
     ap.add_argument("--turns", type=int, default=8)
@@ -279,16 +281,23 @@ def main():
             print("!! 警告: 各相种子不同, 语料不一致, 对比无效。")
             sys.exit(8)
         # 重启守卫: 用与 B 相邻的那一相 (A2, 缺则 A) 的 end_wall
+        # gap = B 启动时刻 - 上一相落盘时刻。重启 27B server 实测 80-150 秒,
+        # "没重启直接重跑" 只有 2-15 秒。阈值取 30 秒: 只拦明显的'没重启',
+        # 不误伤正常重启 (误伤一次 = 浪费一小时, 阈值必须偏松)。
         a_end = (phases[1] or phases[0]).get("end_wall")
         b_start = phases[2].get("start_wall")
         if a_end and b_start:
             gap = b_start - a_end
-            if abs(gap) < 120:
-                print("!! A2 结束到 B 开始仅相隔 %.0f 秒 (每相实际 ~15 分钟)。" % gap)
-                print("!! 说明 B 相 server 没有重启 —— KV cache 跨相残留, 对比无效。")
-                print("!! 重启 server 后重跑 --phase B。")
-                sys.exit(7)
-            print("(A2 结束→B 开始: %.1f 秒, 通过重启守卫)" % gap)
+            if abs(gap) < 30:
+                if args.force:
+                    print("(gap=%.1f 秒偏短, 但给了 --force, 继续; 若 B 相未重启则对比无效)" % gap)
+                else:
+                    print("!! B 开始距上一相仅 %.0f 秒。重启 27B server 通常需 80-150 秒," % gap)
+                    print("!! 这个间隔更像'没重启、同 server 直接重跑' —— KV cache 残留, 对比无效。")
+                    print("!! 若你确实重启了: 加 --force 重跑 --compare。若没重启: 重启后重跑 --phase B。")
+                    sys.exit(7)
+            else:
+                print("(上一相结束→B 开始: %.1f 秒, 与重启时间一致, 通过)" % gap)
         print()
         ctrl = compare_pair(args.outdir, "A", "A2", "A vs A2  [确定性控制: 同一 server, 必须全 NO FORK]")
         print()
