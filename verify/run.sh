@@ -42,8 +42,9 @@ nvcc -O2 -std=c++17 -arch=sm_70 -I "$inc" -I "$cuda" "$here/sm70_verify.cu" -o "
     echo "nvcc build failed" >&2; exit 4; }
 
 # ---- mode envs ----------------------------------------------------------------
-case "$mode" in *o*) export SM70_VERIFY_OOB=1 ;;  *) unset SM70_VERIFY_OOB ;; esac
-case "$mode" in *f*) export SM70_VERIFY_FULL=1 ;; *) unset SM70_VERIFY_FULL ;; esac
+# mode arg sets defaults; pre-set envs always win (SM70_VERIFY_FULL=1 bash run.sh)
+case "$mode" in *o*) export SM70_VERIFY_OOB=1 ;;  esac
+case "$mode" in *f*) export SM70_VERIFY_FULL=1 ;; esac
 
 echo "== run ($mode) =="
 "$bin"
