@@ -18,9 +18,14 @@ $inc  = "$root\sm70-vendor"
 # The harness is valid ONLY against the exact kernel + vendor bundle that was
 # static-audited (md5s below). If the repo drifted, fail loudly instead of
 # producing unverifiable numbers.
-$md5 = { param($p) (Get-FileHash -Algorithm MD5 $p).Hash.ToLower() }
+$md5 = {
+    param($p)
+    $raw = [IO.File]::ReadAllText($p) -replace "`r`n", "`n"   # CRLF-normalized
+    $bytes = [Text.Encoding]::UTF8.GetBytes($raw)
+    (Get-FileHash -Algorithm MD5 -InputStream (New-Object IO.MemoryStream(,$bytes))).Hash.ToLower()
+}
 $kmd5  = $md5 "$root\fattn-sm70-d256-kernel.cuh"
-$expect = "7f32188b7786adb43179f750396a8774"     # fattn-sm70-d256-kernel.cuh @ main bfc1e99 (2026-08-21)
+$expect = "e2c2fa6d1a373d152aa60ed0a2b9ff92"     # fattn-sm70-d256-kernel.cuh @ main bfc1e99, LF-normalized (2026-08-21)
 if ($kmd5 -ne $expect) { throw "kernel md5 drift: $kmd5 != $expect — rebuild the harness audit before trusting results" }
 Write-Host ("kernel md5 ok: " + $kmd5)
 

@@ -23,8 +23,8 @@ mode="${1:-n}"
 # ---- source fingerprint guard -----------------------------------------------
 # The harness is valid ONLY against the exact kernel that was static-audited.
 # If the repo drifted, fail loudly instead of producing unverifiable numbers.
-kmd5="$(md5sum "$cuda/fattn-sm70-d256-kernel.cuh" | cut -d' ' -f1)"
-expect="7f32188b7786adb43179f750396a8774"   # fattn-sm70-d256-kernel.cuh @ main bfc1e99 (2026-08-21)
+kmd5="$(tr -d '\r' < "$cuda/fattn-sm70-d256-kernel.cuh" | md5sum | cut -d' ' -f1)"   # CRLF-normalized
+expect="e2c2fa6d1a373d152aa60ed0a2b9ff92"   # fattn-sm70-d256-kernel.cuh @ main bfc1e99, LF-normalized (2026-08-21)
 if [ "$kmd5" != "$expect" ]; then
     echo "kernel md5 drift: $kmd5 != $expect" >&2
     echo "— audit the diff / update the harness before trusting any numbers" >&2
