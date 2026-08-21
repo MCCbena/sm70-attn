@@ -117,14 +117,30 @@ static int run_case(const Case& tc, bool oob) {
                     ? Kf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
                 Kh[dst_i] = __float2half(val);
             }
-    for (int b = 0; b < nb; ++b) for (int j = 0; j < hkv; ++j)
-        for (int c = 0; c < kv_alloc_rows; ++c)
-            for (int d = 0; d < D; ++d) {
-                const size_t dst_i = (((size_t)(b * hkv + j) * kv_alloc_rows + c) * D + d);
-                const float val = (c < kvlen)
-                    ? Vf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
-                Vh[dst_i] = __float2half(val);
-            }
+    // V device buffer layout MUST match the strides handed to the kernel:
+    //   default : head-major [b][hkv][row][d]  (production K-dequant geometry)
+    //   posmajor: ctx-major  [b][row][hkv][d]  (production -ctv f16 paged cache:
+    //               Vnb1=2048 -> v_row=1024=hkv*D, Vnb2=512 -> v_head=256=D)
+    for (int b = 0; b < nb; ++b) {
+        if (tc.v_posmajor) {
+            for (int c = 0; c < kv_alloc_rows; ++c) for (int j = 0; j < hkv; ++j)
+                for (int d = 0; d < D; ++d) {
+                    const size_t dst_i = (((size_t)(b * kv_alloc_rows + c) * hkv + j) * D + d);
+                    const float val = (c < kvlen)
+                        ? Vf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
+                    Vh[dst_i] = __float2half(val);
+                }
+        } else {
+            for (int j = 0; j < hkv; ++j)
+                for (int c = 0; c < kv_alloc_rows; ++c)
+                    for (int d = 0; d < D; ++d) {
+                        const size_t dst_i = (((size_t)(b * hkv + j) * kv_alloc_rows + c) * D + d);
+                        const float val = (c < kvlen)
+                            ? Vf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
+                        Vh[dst_i] = __float2half(val);
+                    }
+        }
+    }
 
     void *dQ, *dK, *dV, *dO;
     // kernel writes O at [batch][row][head][d] with batch stride = q_pad*heads_q*D
@@ -160,10 +176,8 @@ static int run_case(const Case& tc, bool oob) {
     // (kv_alloc_rows >= 4; page = 4*4*D, v_row = 4*D).
     int v_row_stride, v_head_stride;
     if (tc.v_posmajor) {
-        const int page_ctx = 4;                    // ctx per page (llama.cpp cc700)
-        const int page = page_ctx * hkv * D;       // rows per page
-        v_row_stride  = page_ctx * D;              // V->nb[1]/2 = 1024
-        v_head_stride = D;                         // V->nb[2]/2 = 256
+        v_row_stride  = hkv * D;   // production Vnb1/2 = 4*256 = 1024
+        v_head_stride = D;         // production Vnb2/2 = 256
     } else {
         v_row_stride  = D;
         v_head_stride = (int) head_s;
