@@ -24,7 +24,7 @@ mode="${1:-n}"
 # The harness is valid ONLY against the exact kernel that was static-audited.
 # If the repo drifted, fail loudly instead of producing unverifiable numbers.
 kmd5="$(tr -d '\r' < "$cuda/fattn-sm70-d256-kernel.cuh" | md5sum | cut -d' ' -f1)"   # CRLF-normalized
-expect="e2c2fa6d1a373d152aa60ed0a2b9ff92"   # fattn-sm70-d256-kernel.cuh @ main bfc1e99, LF-normalized (2026-08-21)
+expect="00f7d130ac8fd3ae67db0b468931cf57"   # fattn-sm70-d256-kernel.cuh @ main daca614, LF-normalized (2026-08-23: ElOut template param, f32 output path; audited diff = template signature + single ElementOut store)
 if [ "$kmd5" != "$expect" ]; then
     echo "kernel md5 drift: $kmd5 != $expect" >&2
     echo "— audit the diff / update the harness before trusting any numbers" >&2
