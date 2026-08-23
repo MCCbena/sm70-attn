@@ -304,8 +304,10 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: gqa ratio", cc, Q, K, V, mask);
         return false;
     }
-    const bool kv_ok = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_Q4_0)
-                    && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32 || V->type == GGML_TYPE_Q4_0);
+    // NB (8/23): F32 K/V REJECTED — the launcher only implements F16 (direct)
+    // and Q4_0 (dequant) branches; an F32 tensor would hit GGML_ABORT.
+    const bool kv_ok = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0)
+                    && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0);
     if (!kv_ok) {
         sm70_d256_probe("REJECT: kv type", cc, Q, K, V, mask);
         return false;

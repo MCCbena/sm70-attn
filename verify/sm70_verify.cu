@@ -77,7 +77,8 @@ static std::vector<float> ref_row(const float* q_row, const float* k, const floa
 struct Case { const char* name; int nb, kvlen, q_len; bool sample;
               bool v_posmajor = false;  // true = production position-major V (v_row=hkv*D, v_head=D)
               bool f32out = false;      // true = ElementOut=float kernel (production since 8/23)
-              float amp = 1.0f; };      // input amplitude: >1 spikes QK logits (softmax sharpness probe)
+              float amp = 1.0f;         // input amplitude: >1 spikes QK logits (softmax sharpness probe)
+              bool k_posmajor = false; }; // true = production to_fp16 dequant K layout (pos-major, 8/23 fix)
 
 static int run_case(const Case& tc, bool oob) {
     const int nb = tc.nb, kvlen = tc.kvlen, q_len = tc.q_len;
@@ -108,17 +109,33 @@ static int run_case(const Case& tc, bool oob) {
     const int kv_alloc_rows = oob ? kvlen : kvlen + 3;
     std::vector<__half> Qh(Qf.size()), Kh((size_t) nb * hkv * kv_alloc_rows * D), Vh((size_t) nb * hkv * kv_alloc_rows * D);
     for (size_t i = 0; i < Qf.size(); ++i) Qh[i] = __float2half(Qf[i]);
-    // NOTE: per-head copy with EXPLICIT strides. A linear copy here would
-    // misalign head j by j*3 rows when kv_alloc_rows > kvlen (headroom),
-    // because device layout is [hkv][kv_alloc_rows][D] but source is [hkv][kvlen][D].
-    for (int b = 0; b < nb; ++b) for (int j = 0; j < hkv; ++j)
-        for (int c = 0; c < kv_alloc_rows; ++c)
-            for (int d = 0; d < D; ++d) {
-                const size_t dst_i = (((size_t)(b * hkv + j) * kv_alloc_rows + c) * D + d);
-                const float val = (c < kvlen)
-                    ? Kf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
-                Kh[dst_i] = __float2half(val);
-            }
+    // K device buffer layout MUST match the strides handed to the kernel:
+    //   default  : head-major [b][hkv][row][d]
+    //   posmajor : ctx-major  [b][row][hkv][d]  — the to_fp16 dequant dst
+    //               linearization ([ne1][ne2][ne0]), i.e. production -ctk q4_0
+    //               geometry since the 8/23 stride fix. A linear copy here
+    //               would misalign head j by j*3 rows when kv_alloc_rows >
+    //               kvlen (headroom), so copy per-explicit-stride either way.
+    for (int b = 0; b < nb; ++b) {
+        if (tc.k_posmajor) {
+            for (int c = 0; c < kv_alloc_rows; ++c) for (int j = 0; j < hkv; ++j)
+                for (int d = 0; d < D; ++d) {
+                    const size_t dst_i = (((size_t)(b * kv_alloc_rows + c) * hkv + j) * D + d);
+                    const float val = (c < kvlen)
+                        ? Kf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
+                    Kh[dst_i] = __float2half(val);
+                }
+        } else {
+            for (int j = 0; j < hkv; ++j)
+                for (int c = 0; c < kv_alloc_rows; ++c)
+                    for (int d = 0; d < D; ++d) {
+                        const size_t dst_i = (((size_t)(b * hkv + j) * kv_alloc_rows + c) * D + d);
+                        const float val = (c < kvlen)
+                            ? Kf[(((size_t)(b * hkv + j) * kvlen + c) * D + d)] : 0.0f;
+                        Kh[dst_i] = __float2half(val);
+                    }
+        }
+    }
     // V device buffer layout MUST match the strides handed to the kernel:
     //   default : head-major [b][hkv][row][d]  (production K-dequant geometry)
     //   posmajor: ctx-major  [b][row][hkv][d]  (production -ctv f16 paged cache:
@@ -171,6 +188,17 @@ static int run_case(const Case& tc, bool oob) {
     // separately and NOT what this harness tests.
     const int k_outer = (nb == 1) ? 0 : (int)(hkv * head_s);
     const int v_outer = (nb == 1) ? 0 : (int)(hkv * head_s);
+    // K strides: harness default = head-major (k_row=D, k_head=kv_alloc_rows*D);
+    // k_posmajor = production to_fp16 dequant dst since the 8/23 fix
+    // (pos-major [ne1][ne2][ne0]: k_row=hkv*D, k_head=D).
+    int k_row_stride, k_head_stride;
+    if (tc.k_posmajor) {
+        k_row_stride  = hkv * D;
+        k_head_stride = D;
+    } else {
+        k_row_stride  = D;
+        k_head_stride = (int) head_s;
+    }
     // V strides: harness default = head-major (v_row=D, v_head=kv_alloc_rows*D),
     // matching production ONLY for the dequant path (V=Q4_0). Production
     // production -ctv f16 reads the paged F16 cache DIRECTLY:
@@ -191,14 +219,14 @@ static int run_case(const Case& tc, bool oob) {
         kernel_f32<<<grid, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
-            k_outer, D, (int) head_s,
+            k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
             q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
     } else {
         kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (El*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
-            k_outer, D, (int) head_s,
+            k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
             q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
     }
@@ -306,6 +334,11 @@ int main(int argc, char** argv) {
         { "spiky8-279",   1,  279, 279, false, false, false, 8.0f },
         { "spiky8-f32",   1,  279, 279, false, false, true,  8.0f },
         { "spiky8-pV",    1,  279, 279, false, true,  true,  8.0f },
+        // 8/23 stride-fix regression: production -ctk q4_0 dequant K is
+        // pos-major ([ne1][ne2][ne0]); these pin the fixed stride semantics.
+        { "posK-279",     1,  279, 279, false, false, false, 1.0f, true },
+        { "posKV-279",    1,  279, 279, false, true,  false, 1.0f, true },  // full production geometry (q4_0 K + paged f16 V)
+        { "posKV-f32",    1,  279, 279, false, true,  true,  1.0f, true },
     };
     static const Case big[] = {
         { "full-32k",    1, 32768, 32768, true },
