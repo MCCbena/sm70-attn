@@ -3,6 +3,7 @@
 # attention 输出 (SM70_DUMP), 逐层对比. 8/23 复查报告第五节 E1 的自动化版.
 #
 # 用法 (WSL, ~/sm70-attn 下):   bash verify/dump_ab.sh
+#   CT_V=q4_0 bash verify/dump_ab.sh   # V 走 dequant 路径的变体 (A4 验证)
 # 前置:
 #   1. GPU 空闲 — 先关掉生产 llama-server (脚本会检查并拒绝运行)
 #   2. build/bin/llama-server 已编译到本 commit (cmake --build build)
@@ -60,7 +61,7 @@ start_server() { # $1 = LLAMA_SM70_D256 (1|0), $2 = dump path
   echo "--- starting llama-server (LLAMA_SM70_D256=$1, SM70_DUMP=$2) ..."
   CUDA_VISIBLE_DEVICES=1 LLAMA_SM70_D256=$1 SM70_DUMP=$2 SM70_DUMP_MAX=256 \
   "$BIN" -m "$MODEL" --mmproj "$MMPROJ" --main-gpu 0 -c 8192 -b 4096 -ub 512 \
-    -ngl 99 -fa on -ctk q4_0 -ctv f16 \
+    -ngl 99 -fa on -ctk q4_0 -ctv "${CT_V:-f16}" \
     --spec-type draft-dflash --spec-draft-model "$DRAFT" --spec-draft-n-max 2 \
     -t 12 -tb 16 --temp 0 --top-p 1 --top-k 1 -n 8 -np 1 \
     --host 127.0.0.1 --port $PORT > /tmp/sm70_dump_server.log 2>&1 &
