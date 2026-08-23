@@ -16,7 +16,7 @@ speculative decoding and multimodal fixes.
 ![Perf](https://img.shields.io/badge/176k%20prefill-%2B42.9%25-16a34a)
 ![Gates](https://img.shields.io/badge/harness-23%2F23%20PASS-6366f1)
 
-**English** · [中文](README-sm70.zh.md)
+**English** · [中文](README.md)
 
 </div>
 
