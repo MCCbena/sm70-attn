@@ -423,8 +423,12 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         k_head_stride  = K->nb[2] / sizeof(half);
     } else {
         K_h2 = (const half *) f16_extra.K;
-        k_row_stride   = K->ne[0];          // contiguous dequant buffer
-        k_head_stride  = (int64_t) K->ne[1] * K->ne[0];
+        // 8/23 fix (variant scan pinned): to_fp16_nc linearizes dst as
+        // [ne1][ne2][ne0] = [ctx][hkv][D] (position-major), NOT [ne2][ne1][ne0].
+        // The old head-major strides (row=D, head=ctx*D) scrambled K and were
+        // the root cause of the 0.69 real-input divergence.
+        k_row_stride   = (int64_t) K->ne[2] * K->ne[0]; // hkv * D
+        k_head_stride  = K->ne[0];                       // D
     }
     if (V_is_K_view) {
         V_h2 = K_h2;
@@ -436,8 +440,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         v_head_stride  = V->nb[2] / sizeof(half);
     } else {
         V_h2 = (const half *) f16_extra.V;
-        v_row_stride   = V->ne[0];
-        v_head_stride  = (int64_t) V->ne[1] * V->ne[0];
+        // 8/23 fix: same [ne1][ne2][ne0] position-major layout as K above.
+        v_row_stride   = (int64_t) V->ne[2] * V->ne[0];
+        v_head_stride  = V->ne[0];
     }
 
     // ------------------------------------------------------ stage Q (f32->f16)
