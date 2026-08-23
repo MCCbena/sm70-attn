@@ -76,7 +76,8 @@ static std::vector<float> ref_row(const float* q_row, const float* k, const floa
 
 struct Case { const char* name; int nb, kvlen, q_len; bool sample;
               bool v_posmajor = false;  // true = production position-major V (v_row=hkv*D, v_head=D)
-              bool f32out = false; };   // true = ElementOut=float kernel (production since 8/23)
+              bool f32out = false;      // true = ElementOut=float kernel (production since 8/23)
+              float amp = 1.0f; };      // input amplitude: >1 spikes QK logits (softmax sharpness probe)
 
 static int run_case(const Case& tc, bool oob) {
     const int nb = tc.nb, kvlen = tc.kvlen, q_len = tc.q_len;
@@ -94,9 +95,9 @@ static int run_case(const Case& tc, bool oob) {
                        Vf((size_t) nb * hkv * kvlen * D);
     for (int b = 0; b < nb; ++b) for (int h = 0; h < heads_q; ++h)
         for (int r = 0; r < q_len; ++r) for (int d = 0; d < D; ++d)
-            Qf[((size_t)b * heads_q + h) * q_pad * D + r * D + d] = frand();
-    for (auto& x : Kf) x = frand();
-    for (auto& x : Vf) x = frand();
+            Qf[((size_t)b * heads_q + h) * q_pad * D + r * D + d] = frand() * tc.amp;
+    for (auto& x : Kf) x = frand() * tc.amp;
+    for (auto& x : Vf) x = frand() * tc.amp;
 
     // f16-quantized copies = exactly what the kernel sees
     std::vector<float> Qqf(Qf.size()), Kqf(Kf.size()), Vqf(Vf.size());
@@ -297,8 +298,14 @@ int main(int argc, char** argv) {
         { "nb2-long",    2, 3000, 3000, true  },
         { "posV-279",    1,  279, 279, false, true },
         { "posV-3000",   1, 3000, 3000, true,  true },
-        { "f32out-279",  1,  279, 279, false, false, true },  // f32 output path (production since 8/23)
+        { "f32out-279",  1,  279, 279, false, false, true },
         { "f32out-pV",   1,  279, 279, false, true,  true },
+        // 8/23 cause probe: real-text attention has spiked QK logits (attention
+        // sinks, locality). amp=8 multiplies Q/K/V amplitude -> logits x64 ->
+        // sharp softmax + big V magnitudes, approximating real-load structure.
+        { "spiky8-279",   1,  279, 279, false, false, false, 8.0f },
+        { "spiky8-f32",   1,  279, 279, false, false, true,  8.0f },
+        { "spiky8-pV",    1,  279, 279, false, true,  true,  8.0f },
     };
     static const Case big[] = {
         { "full-32k",    1, 32768, 32768, true },
