@@ -11,6 +11,10 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 // ggml_compute_forward_dup
 
@@ -9199,6 +9203,53 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+// sm70-attn debug: CPU-side twin of the CUDA dump hook (fattn.cu), same
+// record format. Used to produce an f32-accuracy reference phase — run the
+// server with -ctv f32 so the CPU kernel takes the VKQ32 f32-accumulator
+// path, dump through this hook, and compare |A-C| vs |B-C| against the GPU
+// phases to determine which side of the 0.69 ON/OFF divergence carries the
+// error. See verify/sm70_layer_diff.py.
+static void sm70_dump_attn_output_cpu(const ggml_tensor * dst) {
+    static const char * path = getenv("SM70_DUMP");
+    static const int max_calls = path
+        ? (getenv("SM70_DUMP_MAX") ? atoi(getenv("SM70_DUMP_MAX")) : 4096)
+        : 0;
+    if (!path) {
+        return;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    if (Q->ne[0] != 256 || Q->ne[2] != 24) {
+        return; // target model only
+    }
+    static int calls = 0;
+    static FILE * f = nullptr;
+    if (calls >= max_calls) {
+        return;
+    }
+    if (!f) {
+        f = fopen(path, "wb");
+        if (!f) {
+            fprintf(stderr, "[sm70-dump] cannot open %s for writing\n", path);
+            calls = max_calls;
+            return;
+        }
+    }
+    const size_t nbytes = ggml_nbytes(dst);
+    const uint32_t hdr[10] = {
+        0x53444D37u, 1u, (uint32_t) calls, (uint32_t) Q->ne[1],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2], (uint32_t) dst->ne[3],
+        (uint32_t) ((uint64_t) nbytes & 0xFFFFFFFFu),
+        (uint32_t) ((uint64_t) nbytes >> 32),
+    };
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)
+            || fwrite(dst->data, 1, nbytes, f) != nbytes) {
+        fprintf(stderr, "[sm70-dump] short write at call %d\n", calls);
+    }
+    fflush(f);
+    calls++;
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -9213,6 +9264,15 @@ void ggml_compute_forward_flash_attn_ext(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+    // sm70-attn debug dump: dst is written cooperatively by all threads —
+    // barrier, let thread 0 capture the completed tensor, barrier again.
+    if (getenv("SM70_DUMP")) {
+        ggml_barrier(params->threadpool);
+        if (params->ith == 0) {
+            sm70_dump_attn_output_cpu(dst);
+        }
+        ggml_barrier(params->threadpool);
     }
 }
 
