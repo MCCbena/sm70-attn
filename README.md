@@ -138,7 +138,8 @@ bench/prompt_176k.txt            # ROI 负载（勿改动）
 - `main`：工作分支 = 上游 master + 插件（基线 `baseline-2026-08-18`）
 - 远端 `upstream` → ggml-org/llama.cpp；已验证可干净合并
   （8/24 合入 103 提交，冲突仅 workflow 删除项，全链路冒烟通过）
-- 保留分支 `pre-merge-backup-0824` 可整体回滚
+- 合并前的回滚备份分支（`pre-merge-backup-0824`）在合并验证通过后已删除；
+  上游合并已由全链路冒烟与 23/23 回归锁定
 
 ## 致谢与许可
 
