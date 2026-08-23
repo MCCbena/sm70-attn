@@ -142,16 +142,19 @@ bench/prompt_176k.txt            # ROI 负载（勿改动）
 
 ## 致谢与许可
 
+（按贡献代码体量排序）
+
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) —— 宿主，整个
+  代码库的基础（MIT）
+- [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) —— sm70-vendor 闭包中
+  体量最大的部分：CuTe/CUTLASS 头文件 46k 行（Apache-2.0）
+- [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) —— Split-D D256
+  kernel 本体与 SplitKV3 patch 的上游来源——本仓库工作的核心对象
+- [zhinianqin/flash-attention-v100](https://github.com/zhinianqin/flash-attention-v100)
+  —— FA2 base layer，vendor 闭包的另一半（BSD-3）
 - [z-lab/llama.cpp-fork](https://github.com/z-lab/llama.cpp-fork) ——
   DFlash2 投机解码工作的关联 fork；其 #1 零填充方案是我们 M-RoPE 修复
   的起点（我们补上了保持图片请求投机收益的噪声块基点部分）
-- [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) —— Split-D D256
-  kernel 与 SplitKV3 patch 的上游来源
-- [zhinianqin/flash-attention-v100](https://github.com/zhinianqin/flash-attention-v100)
-  —— FA2 base layer（BSD-3）
-- [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) —— CuTe/CUTLASS 头文件
-  闭包（Apache-2.0）
-- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) —— 宿主（MIT）
 
 许可随上游：MIT（llama.cpp 部分）+ BSD-3（flash vendor）+ Apache-2.0
 （cutlass vendor）。
