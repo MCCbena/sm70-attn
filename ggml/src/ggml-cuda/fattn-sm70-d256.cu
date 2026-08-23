@@ -351,9 +351,15 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
 
     const int q_pad = (((int) Q->ne[1] + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
     const int64_t nQ = (int64_t) Q->ne[2] * q_pad * SM70_D256_D * (int) Q->ne[3]; // elems
+    // SplitKV3 partials (worst case): 3 x (q_pad*heads*nb) rows of f32 D
+    // plus per-row max/sum stats, all f32.
+    const int64_t rows3 = (int64_t) q_pad * Q->ne[2] * Q->ne[3];
     // total allocation = output + PAD(f16_extra, 128) + Qs (f16) + Os (f32)
+    //                   + SplitKV3 partial_out/max/sum
     return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128)
-         + (size_t) nQ * sizeof(half) + (size_t) nQ * sizeof(float);
+         + (size_t) nQ * sizeof(half) + (size_t) nQ * sizeof(float)
+         + GGML_PAD((size_t) 3 * rows3 * SM70_D256_D * sizeof(float)
+                    + 2 * (size_t) 3 * rows3 * sizeof(float), 128);
 }
 
 void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -465,40 +471,102 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     using El = cutlass::half_t;
     // ElOut=float: attention output stays f32 end-to-end (8/23 review — the f16
     // Os staging was the largest sm70-side per-layer rounding source).
-    auto kernel = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float>;
+    auto kernel    = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float>;
+    // SplitKV3 (upstream sm70_flash_attn_d256_splitkv3 patch, 8/23 port):
+    // 3-way KV split for long-prefix prefill — triples the CTA count so late
+    // chunks of a long prefill stop serializing their KV sweep on a saturated
+    // SM grid. Env-tunable threshold (default 2048; 0 disables).
+    auto kernel_s3 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true>;
 
     static bool smem_raised = false;
     if (!smem_raised) {
         CUDA_CHECK(cudaFuncSetAttribute((const void *) kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+        CUDA_CHECK(cudaFuncSetAttribute((const void *) kernel_s3,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
         smem_raised = true;
     }
 
-    const dim3 block(Traits::kNThreads);
-    const dim3 grid(q_pad / SM70_D256_BLOCK_M, nb, hkv * gqa);
+    static const int splitkv3_min_kv = [] {
+        const char * e = getenv("LLAMA_SM70_SPLITKV3_MIN_KV");
+        return e ? atoi(e) : 2048;
+    }();
+    const bool use_splitkv3 = nb == 1 && splitkv3_min_kv > 0
+        && kv_len >= splitkv3_min_kv && kv_len > q_len;
 
-    kernel<<<grid, block, Traits::kSmemBytes, stream>>>(
-            (const El *) Qs,
-            (const El *) K_h2,
-            (const El *) V_h2,
-            (float *) Os,
-            /*q_batch_stride*/ (int64_t) (hkv * gqa) * q_pad * SM70_D256_D,  // Qs: [b][head_q][row][d]
-            /*q_row_stride  */ SM70_D256_D,
-            /*q_head_stride */ (int64_t) q_pad * SM70_D256_D,
-            /*k_outer_stride*/ 0,
-            /*k_row_stride  */ (int) k_row_stride,
-            /*k_head_stride */ (int) k_head_stride,
-            /*v_outer_stride*/ 0,
-            /*v_row_stride  */ (int) v_row_stride,
-            /*v_head_stride */ (int) v_head_stride,
-            q_pad,
-            kv_len,
-            hkv * gqa,   // heads_q
-            hkv,         // heads_kv
-            kv_offset,
-            softmax_scale_log2,
-            nullptr, 0, 0);
+    const dim3 block(Traits::kNThreads);
+    const dim3 grid(q_pad / SM70_D256_BLOCK_M,
+                    use_splitkv3 ? (unsigned) (nb * 3) : (unsigned) nb,
+                    hkv * gqa);
+
+    // SplitKV3 partial buffers follow Os in the scratch allocation.
+    const int64_t rows3 = (int64_t) nb * q_pad * hkv * gqa;
+    float * partial_out = (float *) ((char *) Os + (size_t) nQ * sizeof(float));
+    float * partial_max = partial_out + 3 * rows3 * SM70_D256_D;
+    float * partial_sum = partial_max + 3 * rows3;
+
+    if (use_splitkv3) {
+        kernel_s3<<<grid, block, Traits::kSmemBytes, stream>>>(
+                (const El *) Qs,
+                (const El *) K_h2,
+                (const El *) V_h2,
+                (float *) Os,
+                /*q_batch_stride*/ (int64_t) (hkv * gqa) * q_pad * SM70_D256_D,
+                /*q_row_stride  */ SM70_D256_D,
+                /*q_head_stride */ (int64_t) q_pad * SM70_D256_D,
+                /*k_outer_stride*/ 0,
+                /*k_row_stride  */ (int) k_row_stride,
+                /*k_head_stride */ (int) k_head_stride,
+                /*v_outer_stride*/ 0,
+                /*v_row_stride  */ (int) v_row_stride,
+                /*v_head_stride */ (int) v_head_stride,
+                q_pad,
+                kv_len,
+                hkv * gqa,
+                hkv,
+                kv_offset,
+                softmax_scale_log2,
+                nullptr, 0, 0,
+                partial_out, partial_max, partial_sum);
+    } else {
+        kernel<<<grid, block, Traits::kSmemBytes, stream>>>(
+                (const El *) Qs,
+                (const El *) K_h2,
+                (const El *) V_h2,
+                (float *) Os,
+                /*q_batch_stride*/ (int64_t) (hkv * gqa) * q_pad * SM70_D256_D,  // Qs: [b][head_q][row][d]
+                /*q_row_stride  */ SM70_D256_D,
+                /*q_head_stride */ (int64_t) q_pad * SM70_D256_D,
+                /*k_outer_stride*/ 0,
+                /*k_row_stride  */ (int) k_row_stride,
+                /*k_head_stride */ (int) k_head_stride,
+                /*v_outer_stride*/ 0,
+                /*v_row_stride  */ (int) v_row_stride,
+                /*v_head_stride */ (int) v_head_stride,
+                q_pad,
+                kv_len,
+                hkv * gqa,   // heads_q
+                hkv,         // heads_kv
+                kv_offset,
+                softmax_scale_log2,
+                nullptr, 0, 0,
+                nullptr, nullptr, nullptr);
+    }
     CUDA_CHECK(cudaGetLastError());
+
+    if (use_splitkv3) {
+        // Merge the three partial segments straight into the f32 Os staging
+        // buffer (same [row][D] layout the dense path produces).
+        FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
+            <<<dim3((unsigned) rows3), Traits::kHeadDim, 0, stream>>>(
+                (const float *) partial_out,
+                (const float *) partial_max,
+                (const float *) partial_sum,
+                (float *) Os,
+                rows3,
+                softmax_scale_log2);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     // ------------------------------------------------------------- scatter
     {

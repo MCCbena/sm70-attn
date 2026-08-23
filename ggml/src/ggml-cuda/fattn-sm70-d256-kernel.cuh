@@ -415,7 +415,7 @@ __device__ __forceinline__ int64_t paged_kv_thread_offset(
 // (the f16 output staging was a per-layer rounding source; see 8/23 review).
 // Q/K/V must stay f16 (HMMA operand constraint). Upstream-deviation note:
 // template parameter + the single `out[offset] = ElementOut(...)` store below.
-template <typename Element, bool PagedKV, typename ElementOut = Element>
+template <typename Element, bool PagedKV, typename ElementOut = Element, bool SplitKV3 = false>
 __global__ __launch_bounds__(Sm70D256SplitDTraits::kNThreads, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
@@ -439,7 +439,10 @@ void sm70_d256_splitd_dense_kernel(
     float softmax_scale_log2,
     const int *__restrict__ block_table,
     int page_size,
-    int block_table_batch_stride) {
+    int block_table_batch_stride,
+    float *__restrict__ partial_out,
+    float *__restrict__ partial_max,
+    float *__restrict__ partial_sum) {
     using Traits = Sm70D256SplitDTraits;
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
@@ -450,7 +453,8 @@ void sm70_d256_splitd_dense_kernel(
     const int mma_group = warp / Traits::kWarpsPerGroup;
     const int lane = tid % Traits::kMmaThreads;
     const int m_block = blockIdx.x;
-    const int batch = blockIdx.y;
+    const int split = SplitKV3 ? blockIdx.y % 3 : 0;
+    const int batch = SplitKV3 ? blockIdx.y / 3 : blockIdx.y;
     const int head_q = blockIdx.z;
     const int head_kv = head_q / (heads_q / heads_kv);
     const int query_row_base = m_block * kBlockM;
@@ -526,7 +530,17 @@ void sm70_d256_splitd_dense_kernel(
     const int n_block_limit = max_kv_for_tile < kv_len
         ? max_kv_for_tile
         : kv_len;
-    const int n_block_max = cute::ceil_div(n_block_limit, kBlockN) - 1;
+    const int visible_n_blocks = cute::ceil_div(n_block_limit, kBlockN);
+    int n_block_min = 0;
+    int n_block_max = visible_n_blocks - 1;
+    if constexpr (SplitKV3) {
+        n_block_min = visible_n_blocks * split / 3;
+        n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
+    }
+    // SplitKV3 guard: an empty split segment (n_block_max < n_block_min) must
+    // still load a valid first tile to keep the gmem addresses in range; use
+    // n_block_min (always < visible_n_blocks) for that degenerate case.
+    const int n_block_first = n_block_max >= n_block_min ? n_block_max : n_block_min;
 
     const int64_t k_batch_offset = PagedKV
         ? 0
@@ -544,7 +558,7 @@ void sm70_d256_splitd_dense_kernel(
     auto gKFirst = local_tile(
         mK,
         Shape<Int<kBlockN>, Int<kDChunk>>{},
-        make_coord(n_block_max, 0));
+        make_coord(n_block_first, 0));
     auto tKgKFirstRaw = gmem_k_thread.partition_S(gKFirst);
     auto tKgKFirst = reshape_kv_thread_tensor<PagedKV>(tKgKFirstRaw);
     int64_t k_thread_tile_base = 0;
@@ -553,7 +567,7 @@ void sm70_d256_splitd_dense_kernel(
             Traits::kGmemKThreadsPerRow,
             Traits::kGmemKRowsPerThread,
             Traits::kGmemKElemsPerLoad>(
-                tid, n_block_max, 0, page_size, sequence_block_table,
+                tid, n_block_first, 0, page_size, sequence_block_table,
                 k_outer_stride,
                 k_row_stride);
         tKgKFirst.data() = mK.data() + k_thread_tile_base;
@@ -561,7 +575,7 @@ void sm70_d256_splitd_dense_kernel(
     copy_even_tile(gmem_k_copy, tKgKFirst, tKsK);
     __syncthreads();
 
-    for (int n_block = n_block_max; n_block >= 0; --n_block) {
+    for (int n_block = n_block_max; n_block >= n_block_min; --n_block) {
         const int n_warp = warp & 1;
         const int group_row_base = mma_group * Traits::kGroupRows;
         const int qk_row_base = group_row_base
@@ -757,7 +771,7 @@ void sm70_d256_splitd_dense_kernel(
                 store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
                 store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
                 __syncthreads();
-                if (n_block > 0) {
+                if (n_block > n_block_min) {
                     auto gKNextBlock = local_tile(
                         mK,
                         Shape<Int<kBlockN>, Int<kDChunk>>{},
@@ -784,7 +798,7 @@ void sm70_d256_splitd_dense_kernel(
                 }
             }
         }
-        if (n_block > 0) {
+        if (n_block > n_block_min) {
             cute::copy(tKrKNext, tKsK);
             __syncthreads();
         }
@@ -802,54 +816,147 @@ void sm70_d256_splitd_dense_kernel(
         row_sum[slot] = FLASH_NAMESPACE::sm70_row_allreduce_8(
             row_sum[slot], sum_op);
     }
-    if ((lane & 0x0e) == 0) {
+    if constexpr (SplitKV3) {
+        // 3-way partial output: unnormalized numerator + raw max/sum per row.
+        // The merge kernel (below) combines the three segments with the
+        // standard flash-decode scale formula. Layout: [split][row][D] where
+        // row = (batch * query_len + query_row) * heads_q + head_q.
+        const int64_t split_row_stride =
+            static_cast<int64_t>(gridDim.y / 3) * query_len * heads_q;
+        if ((lane & 0x0e) == 0) {
 #pragma unroll
-        for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
-            const int row = FLASH_NAMESPACE::sm70_row_slot<
-                Traits::kQkWarpRows>(slot, lane);
-            row_sum_exchange[
-                mma_group * Traits::kGroupRows
-                + n_warp * Traits::kQkWarpRows + row] = row_sum[slot];
-        }
-    }
-    __syncthreads();
-
-    const int64_t out_batch_offset =
-        static_cast<int64_t>(batch) * query_len * heads_q * Traits::kHeadDim;
-#pragma unroll
-    for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
-        auto acc_o = make_tensor(
-            make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
-        auto acc_o_rc = make_tensor(
-            acc_o.data(),
-            FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
-#pragma unroll
-        for (int row = 0; row < Traits::kOutputRowsPerThread; ++row) {
-            const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
-                Traits::kGroupRows>(row, lane);
-            const float inv_sum = 1.0f / row_sum_exchange[
-                mma_group * Traits::kGroupRows + logical_row];
-#pragma unroll
-            for (int col = 0; col < size<1>(acc_o_rc); ++col) {
-                acc_o_rc(row, col) *= inv_sum;
+            for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
+                const int row = FLASH_NAMESPACE::sm70_row_slot<
+                    Traits::kQkWarpRows>(slot, lane);
+                const int query_row = query_row_base
+                    + group_row_base + n_warp * Traits::kQkWarpRows + row;
+                const int64_t row_offset =
+                    (static_cast<int64_t>(batch) * query_len + query_row)
+                        * heads_q
+                    + head_q;
+                const int64_t partial_row =
+                    split * split_row_stride + row_offset;
+                partial_max[partial_row] = row_max[slot];
+                partial_sum[partial_row] = row_sum[slot];
             }
         }
 
-        auto cO = make_identity_tensor(
-            Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
-        auto tOcO = pv_mma_thread.partition_C(cO);
 #pragma unroll
-        for (int i = 0; i < size(acc_o); ++i) {
-            const int row = get<0>(tOcO(i));
-            const int col = get<1>(tOcO(i));
-            const int query_row = query_row_base + group_row_base + row;
-            const int64_t offset = out_batch_offset
-                + static_cast<int64_t>(query_row) * heads_q * Traits::kHeadDim
-                + head_q * Traits::kHeadDim
-                + (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
-            out[offset] = ElementOut(acc_o(i));
+        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
+            auto acc_o = make_tensor(
+                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
+            auto cO = make_identity_tensor(
+                Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
+            auto tOcO = pv_mma_thread.partition_C(cO);
+#pragma unroll
+            for (int i = 0; i < size(acc_o); ++i) {
+                const int row = get<0>(tOcO(i));
+                const int col = get<1>(tOcO(i));
+                const int query_row = query_row_base + group_row_base + row;
+                const int64_t row_offset =
+                    (static_cast<int64_t>(batch) * query_len + query_row)
+                        * heads_q
+                    + head_q;
+                const int64_t partial_row =
+                    split * split_row_stride + row_offset;
+                const int d =
+                    (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
+                partial_out[partial_row * Traits::kHeadDim + d] = acc_o(i);
+            }
+        }
+    } else {
+        if ((lane & 0x0e) == 0) {
+#pragma unroll
+            for (int slot = 0; slot < Traits::kQkRowsPerThread; ++slot) {
+                const int row = FLASH_NAMESPACE::sm70_row_slot<
+                    Traits::kQkWarpRows>(slot, lane);
+                row_sum_exchange[
+                    mma_group * Traits::kGroupRows
+                    + n_warp * Traits::kQkWarpRows + row] = row_sum[slot];
+            }
+        }
+        __syncthreads();
+
+        const int64_t out_batch_offset =
+            static_cast<int64_t>(batch) * query_len * heads_q * Traits::kHeadDim;
+#pragma unroll
+        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
+            auto acc_o = make_tensor(
+                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
+            auto acc_o_rc = make_tensor(
+                acc_o.data(),
+                FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+#pragma unroll
+            for (int row = 0; row < Traits::kOutputRowsPerThread; ++row) {
+                const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
+                    Traits::kGroupRows>(row, lane);
+                const float inv_sum = 1.0f / row_sum_exchange[
+                    mma_group * Traits::kGroupRows + logical_row];
+#pragma unroll
+                for (int col = 0; col < size<1>(acc_o_rc); ++col) {
+                    acc_o_rc(row, col) *= inv_sum;
+                }
+            }
+
+            auto cO = make_identity_tensor(
+                Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
+            auto tOcO = pv_mma_thread.partition_C(cO);
+#pragma unroll
+            for (int i = 0; i < size(acc_o); ++i) {
+                const int row = get<0>(tOcO(i));
+                const int col = get<1>(tOcO(i));
+                const int query_row = query_row_base + group_row_base + row;
+                const int64_t offset = out_batch_offset
+                    + static_cast<int64_t>(query_row) * heads_q * Traits::kHeadDim
+                    + head_q * Traits::kHeadDim
+                    + (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
+                out[offset] = ElementOut(acc_o(i));
+            }
         }
     }
+}
+
+// SplitKV3 merge kernel (from the upstream sm70_flash_attn_d256_splitkv3
+// patch): combines the three partial segments per output row. Writes into the
+// f32 Os staging buffer (same [row][D] layout the dense path produces and the
+// scatter kernel consumes).
+__global__ __launch_bounds__(Sm70D256SplitDTraits::kHeadDim, 1)
+void sm70_d256_splitkv3_merge_kernel(
+        const float *__restrict__ partial_out,
+        const float *__restrict__ partial_max,
+        const float *__restrict__ partial_sum,
+        float *__restrict__ out,
+        int64_t rows,
+        float softmax_scale_log2) {
+    const int64_t row = blockIdx.x;
+    const int d = threadIdx.x;
+    __shared__ float merge[4];
+    if (d == 0) {
+        const float max0 = partial_max[row];
+        const float max1 = partial_max[rows + row];
+        const float max2 = partial_max[2 * rows + row];
+        const float global_max = fmaxf(fmaxf(max2, max1), max0);
+        const float scale2 = exp2f((max2 - global_max) * softmax_scale_log2);
+        const float scale1 = exp2f((max1 - global_max) * softmax_scale_log2);
+        const float scale0 = exp2f((max0 - global_max) * softmax_scale_log2);
+        const float denominator =
+            (partial_sum[2 * rows + row] * scale2
+             + partial_sum[rows + row] * scale1)
+            + partial_sum[row] * scale0;
+        merge[0] = scale0;
+        merge[1] = scale1;
+        merge[2] = scale2;
+        merge[3] = 1.0f / denominator;
+    }
+    __syncthreads();
+
+    const int64_t element = row * Sm70D256SplitDTraits::kHeadDim + d;
+    const int64_t split_stride = rows * Sm70D256SplitDTraits::kHeadDim;
+    const float numerator =
+        (partial_out[2 * split_stride + element] * merge[2]
+         + partial_out[split_stride + element] * merge[1])
+        + partial_out[element] * merge[0];
+    out[element] = numerator * merge[3];
 }
 
 }  // namespace FLASH_NAMESPACE

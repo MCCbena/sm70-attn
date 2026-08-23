@@ -78,7 +78,8 @@ struct Case { const char* name; int nb, kvlen, q_len; bool sample;
               bool v_posmajor = false;  // true = production position-major V (v_row=hkv*D, v_head=D)
               bool f32out = false;      // true = ElementOut=float kernel (production since 8/23)
               float amp = 1.0f;         // input amplitude: >1 spikes QK logits (softmax sharpness probe)
-              bool k_posmajor = false; }; // true = production to_fp16 dequant K layout (pos-major, 8/23 fix)
+              bool k_posmajor = false;  // true = production to_fp16 dequant K layout (pos-major, 8/23 fix)
+              bool splitkv3 = false; }; // true = 3-way KV split + merge path (8/23 port; implies f32out)
 
 static int run_case(const Case& tc, bool oob) {
     const int nb = tc.nb, kvlen = tc.kvlen, q_len = tc.q_len;
@@ -173,10 +174,12 @@ static int run_case(const Case& tc, bool oob) {
     CK(cudaMemcpy(dV, Vh.data(), Vh.size() * sizeof(El), cudaMemcpyHostToDevice));
     auto kernel     = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
     auto kernel_f32 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float>;
+    auto kernel_s3  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true>;
     static bool smem_raised = false;
     if (!smem_raised) {
         CK(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
         CK(cudaFuncSetAttribute((const void*) kernel_f32, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+        CK(cudaFuncSetAttribute((const void*) kernel_s3, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
         smem_raised = true;
     }
     const dim3 block(Traits::kNThreads);
@@ -215,20 +218,49 @@ static int run_case(const Case& tc, bool oob) {
         v_head_stride = (int) head_s;
     }
 
-    if (tc.f32out) {
+    if (tc.splitkv3) {
+        // SplitKV3 path: 3-way partial kernel (grid.y = 3) + merge kernel.
+        // Output layout is identical to the dense path ([b][row][head][d]),
+        // written f32 by the merge kernel.
+        const int64_t rows3 = (int64_t) q_pad * heads_q;   // nb == 1 for these cases
+        float * dPout, * dPmax, * dPsum;
+        CK(cudaMalloc(&dPout, (size_t) (3 * rows3 * D) * sizeof(float)));
+        CK(cudaMalloc(&dPmax, (size_t) (3 * rows3) * sizeof(float)));
+        CK(cudaMalloc(&dPsum, (size_t) (3 * rows3) * sizeof(float)));
+        const dim3 grid3(q_pad / 64, 3, heads_q);
+        kernel_s3<<<grid3, block, Traits::kSmemBytes, 0>>>(
+            (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
+            (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
+            k_outer, k_row_stride, k_head_stride,
+            v_outer, v_row_stride, v_head_stride,
+            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0,
+            dPout, dPmax, dPsum);
+        CK(cudaGetLastError());
+        FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
+            <<<dim3((unsigned) rows3), D, 0, 0>>>(
+                (const float*) dPout, (const float*) dPmax, (const float*) dPsum,
+                (float*) dO, rows3, scale_log2);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(dPout));
+        CK(cudaFree(dPmax));
+        CK(cudaFree(dPsum));
+    } else if (tc.f32out) {
         kernel_f32<<<grid, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
+            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0,
+            nullptr, nullptr, nullptr);
     } else {
         kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (El*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
+            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0,
+            nullptr, nullptr, nullptr);
     }
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
@@ -339,6 +371,12 @@ int main(int argc, char** argv) {
         { "posK-279",     1,  279, 279, false, false, false, 1.0f, true },
         { "posKV-279",    1,  279, 279, false, true,  false, 1.0f, true },  // full production geometry (q4_0 K + paged f16 V)
         { "posKV-f32",    1,  279, 279, false, true,  true,  1.0f, true },
+        // 8/23 splitkv3 port: 3-way KV split + merge must match the dense path
+        // and the CPU reference. splitkv3-600: prefix geometry (all three
+        // segments non-empty). splitkv3-edge: kv == q, third segment empty —
+        // exercises the empty-split gmem guard (must not crash, zero contribution).
+        { "splitkv3-600",  1, 600, 279, false, false, true, 1.0f, false, true },
+        { "splitkv3-edge", 1, 279, 279, false, false, true, 1.0f, false, true },
     };
     static const Case big[] = {
         { "full-32k",    1, 32768, 32768, true },
