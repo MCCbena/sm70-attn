@@ -153,3 +153,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# local kernel-harness binary (built by verify/, not tracked)
+verify/sm70_verify
