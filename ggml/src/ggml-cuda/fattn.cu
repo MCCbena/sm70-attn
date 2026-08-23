@@ -642,6 +642,17 @@ static void sm70_dump_attn_output(ggml_backend_cuda_context & ctx, const ggml_te
     if (Q->ne[0] != 256 || Q->ne[2] != 24) {
         return; // target model only
     }
+    // CUDA graph capture in progress: a D2H memcpy to pageable host memory is
+    // not permitted during capture (llama.cpp graphs decode steps once stable,
+    // which is exactly how the 8/23 first run aborted). Captured graphs never
+    // re-enter this hook on replay either, so skipping is the only correct
+    // behavior — decode steps under graph replay are simply not dumped, while
+    // prefill chunks execute outside capture on their first call.
+    cudaStreamCaptureStatus cap_status;
+    if (cudaStreamIsCapturing(ctx.stream(), &cap_status) != cudaSuccess
+            || cap_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
     static int calls = 0;
     static FILE * f = nullptr;
     if (calls >= max_calls) {
