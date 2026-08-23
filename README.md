@@ -53,6 +53,15 @@ V100 单卡 · Qwen3.8-27B Q4_K_XL · `-fa on -ctk q4_0 -ctv f16`：
 > 是 17GB 权重的显存带宽，不是注意力。这正是我们**不**移植 1Cat XQA
 > decode kernel 的决策依据（详见英文 README「Upstream status」）。
 
+### 176k 注意力路径实测（Nsight Compute）
+
+![176k 注意力路径火焰图](media/flamegraph-176k.png)
+
+176,000 token prefill 的注意力管线耗时构成（V100 实测 kernel 时间）：
+**splitd_dense kernel 占 97%（162 秒纯 HMMA）**，K 去量化 staging 仅
+2.6%，SplitKV3 merge + Q 暂存合计不足 0.4%——注意力侧已无低垂果实，
+这份数据同时是 XQA decode 不移植决策的量化依据。
+
 ## 快速开始
 
 ```bash

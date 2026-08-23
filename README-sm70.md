@@ -25,6 +25,16 @@ speculative decoding and multimodal fixes.
 Private fork of llama.cpp carrying a SM70 (V100) D256 flash-attention plugin for
 Qwen3.5/3.6/3.8-27B (head_dim=256, GQA 6:1, 16 full-attention layers).
 
+### Attention path at 176k, measured (Nsight Compute)
+
+![176k attention-path flamegraph](media/flamegraph-176k.png)
+
+Real kernel times of the attention pipeline during a 176,000-token prefill on
+V100: the Split-D kernel is **97% of the path (162 s of pure HMMA)**; the K
+dequant staging costs 2.6% and SplitKV3 merge + Q staging under 0.4% — no
+low-hanging fruit left on the attention side, and the quantitative basis for
+declining the 1Cat XQA decode port.
+
 ## What is in here
 
 - Upstream master baseline (tag `baseline-2026-08-18` = ggml-org/llama.cpp `25ae3a9b3`).
