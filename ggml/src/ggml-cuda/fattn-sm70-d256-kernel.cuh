@@ -522,7 +522,12 @@ void sm70_d256_splitd_dense_kernel(
     float row_sum[Traits::kQkRowsPerThread];
 #pragma unroll
     for (int row = 0; row < Traits::kQkRowsPerThread; ++row) {
-        row_max[row] = -INFINITY;
+        // SplitKV3: a row's causal window may not overlap this segment at all
+        // (fully-masked row) — keep row_max finite so exp2 never sees
+        // (-inf) - (-inf) = NaN. -1e30 behaves as -inf under exp2 (flushes to
+        // zero) and the merge kernel's scale stays 0. The dense path keeps
+        // -INFINITY (every row always sees causal block 0 there).
+        row_max[row] = SplitKV3 ? -1.0e30f : -INFINITY;
         row_sum[row] = 0.0f;
     }
 
