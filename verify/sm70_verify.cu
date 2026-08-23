@@ -75,7 +75,8 @@ static std::vector<float> ref_row(const float* q_row, const float* k, const floa
 }
 
 struct Case { const char* name; int nb, kvlen, q_len; bool sample;
-              bool v_posmajor = false; };  // true = production position-major V (v_row=hkv*D, v_head=D)
+              bool v_posmajor = false;  // true = production position-major V (v_row=hkv*D, v_head=D)
+              bool f32out = false; };   // true = ElementOut=float kernel (production since 8/23)
 
 static int run_case(const Case& tc, bool oob) {
     const int nb = tc.nb, kvlen = tc.kvlen, q_len = tc.q_len;
@@ -148,14 +149,16 @@ static int run_case(const Case& tc, bool oob) {
     CK(cudaMalloc(&dQ, Qh.size() * sizeof(El)));
     CK(cudaMalloc(&dK, Kh.size() * sizeof(El)));
     CK(cudaMalloc(&dV, Vh.size() * sizeof(El)));
-    CK(cudaMalloc(&dO, (size_t) nb * q_pad * heads_q * D * sizeof(El)));
+    CK(cudaMalloc(&dO, (size_t) nb * q_pad * heads_q * D * (tc.f32out ? sizeof(float) : sizeof(El))));
     CK(cudaMemcpy(dQ, Qh.data(), Qh.size() * sizeof(El), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dK, Kh.data(), Kh.size() * sizeof(El), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dV, Vh.data(), Vh.size() * sizeof(El), cudaMemcpyHostToDevice));
-    auto kernel = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
+    auto kernel     = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
+    auto kernel_f32 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float>;
     static bool smem_raised = false;
     if (!smem_raised) {
         CK(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+        CK(cudaFuncSetAttribute((const void*) kernel_f32, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
         smem_raised = true;
     }
     const dim3 block(Traits::kNThreads);
@@ -183,17 +186,34 @@ static int run_case(const Case& tc, bool oob) {
         v_head_stride = (int) head_s;
     }
 
-    kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
-        (const El*) dQ, (const El*) dK, (const El*) dV, (El*) dO,
-        (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
-        k_outer, D, (int) head_s,
-        v_outer, v_row_stride, v_head_stride,
-        q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
+    if (tc.f32out) {
+        kernel_f32<<<grid, block, Traits::kSmemBytes, 0>>>(
+            (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
+            (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
+            k_outer, D, (int) head_s,
+            v_outer, v_row_stride, v_head_stride,
+            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
+    } else {
+        kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
+            (const El*) dQ, (const El*) dK, (const El*) dV, (El*) dO,
+            (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
+            k_outer, D, (int) head_s,
+            v_outer, v_row_stride, v_head_stride,
+            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0);
+    }
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
-    std::vector<__half> Ohost((size_t) nb * q_pad * heads_q * D);
-    CK(cudaMemcpy(Ohost.data(), dO, Ohost.size() * sizeof(El), cudaMemcpyDeviceToHost));
+    // O host copy: always float for comparison (f32out: direct; f16out: exact
+    // half->float conversion once on host).
+    std::vector<float> Ohost((size_t) nb * q_pad * heads_q * D);
+    if (tc.f32out) {
+        CK(cudaMemcpy(Ohost.data(), dO, Ohost.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    } else {
+        std::vector<__half> tmp(Ohost.size());
+        CK(cudaMemcpy(tmp.data(), dO, tmp.size() * sizeof(El), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < tmp.size(); ++i) { Ohost[i] = __half2float(tmp[i]); }
+    }
 
     // which rows/heads to check
     std::vector<int> rows, heads;
@@ -228,13 +248,13 @@ static int run_case(const Case& tc, bool oob) {
         const float* kbase = &Kqf[((size_t) b * hkv + hkv_idx) * kvlen * D];
         const float* vbase = &Vqf[((size_t) b * hkv + hkv_idx) * kvlen * D];
         // kernel O layout: [b][row][head][d], batch stride q_pad*heads_q*D (row stride heads_q*D)
-        const __half* obase = &Ohost[((size_t) b * q_pad * heads_q) * D];
+        const float* obase = &Ohost[((size_t) b * q_pad * heads_q) * D];
         for (int r : rows) {
             float ref[256];
             ref_row(qbase + (size_t) r * D, kbase, vbase, kvlen, kv_offset, r, ref);
-            const __half* orow = obase + ((size_t) r * heads_q + h) * D;   // [b][row][head][d]
+            const float* orow = obase + ((size_t) r * heads_q + h) * D;   // [b][row][head][d]
             for (int d = 0; d < D; ++d) {
-                const float got = __half2float(orow[d]);
+                const float got = orow[d];
                 ncmp++;
                 if (std::isnan(got) || std::isinf(got)) {
                     nan_out++;
@@ -275,8 +295,10 @@ int main(int argc, char** argv) {
         { "long-3000",   1, 3000, 3000, true  },  // 94 N-blocks, sampled
         { "nb2-279",     2,  279, 279, true  },  // batch=2, sampled
         { "nb2-long",    2, 3000, 3000, true  },
-        { "posV-279",    1,  279, 279, false, true },  // production V strides (pos-major F16 direct)
+        { "posV-279",    1,  279, 279, false, true },
         { "posV-3000",   1, 3000, 3000, true,  true },
+        { "f32out-279",  1,  279, 279, false, false, true },  // f32 output path (production since 8/23)
+        { "f32out-pV",   1,  279, 279, false, true,  true },
     };
     static const Case big[] = {
         { "full-32k",    1, 32768, 32768, true },

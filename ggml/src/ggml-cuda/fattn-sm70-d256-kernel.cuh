@@ -410,13 +410,18 @@ __device__ __forceinline__ int64_t paged_kv_thread_offset(
         + (tid % kThreadsPerRow) * kElemsPerLoad;
 }
 
-template <typename Element, bool PagedKV>
+// ElementOut (default = Element): output element type. The production launcher
+// instantiates ElementOut=float so the attention output is written f32 directly
+// (the f16 output staging was a per-layer rounding source; see 8/23 review).
+// Q/K/V must stay f16 (HMMA operand constraint). Upstream-deviation note:
+// template parameter + the single `out[offset] = ElementOut(...)` store below.
+template <typename Element, bool PagedKV, typename ElementOut = Element>
 __global__ __launch_bounds__(Sm70D256SplitDTraits::kNThreads, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
     const Element *__restrict__ k,
     const Element *__restrict__ v,
-    Element *__restrict__ out,
+    ElementOut *__restrict__ out,
     int q_batch_stride,
     int q_row_stride,
     int q_head_stride,
@@ -842,7 +847,7 @@ void sm70_d256_splitd_dense_kernel(
                 + static_cast<int64_t>(query_row) * heads_q * Traits::kHeadDim
                 + head_q * Traits::kHeadDim
                 + (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
-            out[offset] = Element(acc_o(i));
+            out[offset] = ElementOut(acc_o(i));
         }
     }
 }

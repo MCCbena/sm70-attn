@@ -33,6 +33,9 @@
 //     j = KV head (K/V select), b = sequence.
 //   * Scratch layout: [hkv][gqa][nb][rows][256] f16, slice(j,c) at
 //     (j*gqa + c) * nb * rows * 256; seq b at b * rows * 256 inside.
+//   * Output (8/23 review): the kernel writes f32 directly into Os
+//     (ElementOut=float; was: f16 staging + f16->f32 scatter). The f16
+//     staging was the largest sm70-side per-layer rounding source.
 //   * Rollback: env LLAMA_SM70_D256=0 forces the stock path.
 
 #include "common.cuh"
@@ -83,10 +86,10 @@ __global__ void sm70_d256_stage_q_kernel(
       + (int64_t) r * 128] = __float22half2_rn(v);
 }
 
-// Output scatter: staged [hkv][gqa][nb][rows][256] f16 -> stock f32 dst.
+// Output scatter: staged [hkv][gqa][nb][rows][256] f32 -> stock f32 dst.
 // grid = (q_len, nb*hkv, gqa); block = 128.
 __global__ void sm70_d256_scatter_kernel(
-        const half2 * __restrict__ src, float2 * __restrict__ dst,
+        const float2 * __restrict__ src, float2 * __restrict__ dst,
         const int hkv, const int gqa, const int nb,
         const int q_pad,
         const int64_t dst_row, const int64_t dst_head, const int64_t dst_seq) {
@@ -99,18 +102,15 @@ __global__ void sm70_d256_scatter_kernel(
     const int heads_q = hkv * gqa;      // 24
     const int d2 = SM70_D256_D / 2;     // 128 half2 per head
     // Os layout (kernel-hardcoded): [batch][row][head_q][D]; batch stride uses q_pad.
-    const half2 v = src[threadIdx.x
+    const float2 v = src[threadIdx.x
         + (int64_t) b * (int64_t) q_pad * heads_q * d2
         + (int64_t) r * (heads_q * d2)
         + (int64_t) head_q * d2];
-    float2 o;
-    o.x = __low2float(v);
-    o.y = __high2float(v);
     // dst (f32 Q layout (D, q_len, heads, batch)): row + global head_q + seq.
     dst[threadIdx.x
       + (int64_t) r * dst_row
       + (int64_t) head_q * dst_head
-      + (int64_t) b * dst_seq] = o;
+      + (int64_t) b * dst_seq] = v;
 }
 
 // dequant K/V (q4_0 / f32) into the stock f16 extra buffers — same code
@@ -286,9 +286,10 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
     const size_t f16_extra_size = (size_t) (f16_extra.end - ((uintptr_t) dst->data + ggml_nbytes(dst)));
 
     const int q_pad = (((int) Q->ne[1] + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
-    const int64_t nQ = (int64_t) Q->ne[2] * q_pad * SM70_D256_D * (int) Q->ne[3]; // f16 elems
-    // total allocation = output + PAD(f16_extra, 128) + Qs + Os
-    return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128) + (size_t) (2 * nQ) * sizeof(half);
+    const int64_t nQ = (int64_t) Q->ne[2] * q_pad * SM70_D256_D * (int) Q->ne[3]; // elems
+    // total allocation = output + PAD(f16_extra, 128) + Qs (f16) + Os (f32)
+    return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128)
+         + (size_t) nQ * sizeof(half) + (size_t) nQ * sizeof(float);
 }
 
 void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -323,7 +324,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     GGML_ASSERT(logit_softcap == 0.0f);
     const float softmax_scale_log2 = scale * M_LOG2E;
     const int kv_offset = kv_len - q_len;
-    const int64_t nQ = (int64_t) hkv * gqa * nb * q_pad * SM70_D256_D; // f16 elems
+    const int64_t nQ = (int64_t) hkv * gqa * nb * q_pad * SM70_D256_D; // Qs elems (f16); Os same count in f32
 
     // ------------------------------------- scratch layout (extra region)
     // base = start of the get_alloc_size extra region (right after dst out)
@@ -339,10 +340,11 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     dequant_bytes = GGML_PAD(dequant_bytes, 128);
     char * Qs_bytes = (char *) base + dequant_bytes;
     half * Qs = (half *) Qs_bytes;
-    half * Os = (half *) (Qs_bytes + (size_t) nQ * sizeof(half));
+    float * Os = (float *) (Qs_bytes + (size_t) nQ * sizeof(half));
 
     // zero pad rows of Qs (their outputs are never scattered back) and all of Os
-    CUDA_CHECK(cudaMemsetAsync((void *) Qs_bytes, 0, (size_t) 2 * nQ * sizeof(half), ctx.stream()));
+    CUDA_CHECK(cudaMemsetAsync((void *) Qs_bytes, 0,
+        (size_t) nQ * sizeof(half) + (size_t) nQ * sizeof(float), ctx.stream()));
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
@@ -388,7 +390,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     // ------------------------------------------------------------- attention
     using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
     using El = cutlass::half_t;
-    auto kernel = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
+    // ElOut=float: attention output stays f32 end-to-end (8/23 review — the f16
+    // Os staging was the largest sm70-side per-layer rounding source).
+    auto kernel = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float>;
 
     static bool smem_raised = false;
     if (!smem_raised) {
@@ -404,7 +408,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             (const El *) Qs,
             (const El *) K_h2,
             (const El *) V_h2,
-            (El *) Os,
+            (float *) Os,
             /*q_batch_stride*/ (int64_t) (hkv * gqa) * q_pad * SM70_D256_D,  // Qs: [b][head_q][row][d]
             /*q_row_stride  */ SM70_D256_D,
             /*q_head_stride */ (int64_t) q_pad * SM70_D256_D,
@@ -427,7 +431,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     {
         const dim3 grid(q_len, nb * hkv, gqa);
         sm70_d256_scatter_kernel<<<grid, 128, 0, stream>>>(
-            (const half2 *) Os, (float2 *) dst->data, hkv, gqa, nb, q_pad,
+            (const float2 *) Os, (float2 *) dst->data, hkv, gqa, nb, q_pad,
             Q->nb[1] / 8, Q->nb[2] / 8, Q->nb[3] / 8);
         CUDA_CHECK(cudaGetLastError());
     }
