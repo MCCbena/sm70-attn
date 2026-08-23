@@ -116,7 +116,9 @@ llama.cpp 原生路径，无需配置。
 process() 时每行位置都是常数（M-RoPE 空间结构只存在于 target），draft 的
 一维 KV cache 存不了这种形状。修复：跳过 embedding 批次 + 零特征填洞 +
 噪声块基点改用 draft cache 自身的 `pos_max+1`。输出分布精确不变，只有
-图片区间的 draft 接受率轻微下降（0.88 → 0.57 → 恢复）。
+图片区间的 draft 接受率轻微下降（0.88 → 0.57 → 恢复）。零填充思路来自
+[z-lab fork #1](https://github.com/z-lab/llama.cpp-fork)；噪声块基点
+（保住图片请求投机收益的关键增量）与端到端验证为本仓库工作。
 
 ## 目录速览
 
@@ -140,6 +142,9 @@ bench/prompt_176k.txt            # ROI 负载（勿改动）
 
 ## 致谢与许可
 
+- [z-lab/llama.cpp-fork](https://github.com/z-lab/llama.cpp-fork) ——
+  DFlash2 投机解码工作的关联 fork；其 #1 零填充方案是我们 M-RoPE 修复
+  的起点（我们补上了保持图片请求投机收益的噪声块基点部分）
 - [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) —— Split-D D256
   kernel 与 SplitKV3 patch 的上游来源
 - [zhinianqin/flash-attention-v100](https://github.com/zhinianqin/flash-attention-v100)

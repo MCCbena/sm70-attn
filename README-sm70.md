@@ -103,8 +103,10 @@ image_pos + grid_height (53+47), not image_pos + n_rows. The draft's 1-D KV
 cache can store neither shape — chunk 2 of the ubatch loop failed the
 continuity check.
 
-Fix (three surgical changes in `common/speculative.cpp`, z-lab fork #1
-approach adapted to our real-feature injection):
+Fix (three surgical changes in `common/speculative.cpp`; the zero-fill
+approach originates from the [z-lab fork #1](https://github.com/z-lab/llama.cpp-fork),
+with the noise-block base change — the part that keeps speculative decoding
+working on image requests — and the end-to-end validation being our additions):
 
 1. `process()` skips embedding batches entirely; the hole is zero-filled
    with zero-feature encoder rows when the next token batch arrives (the
