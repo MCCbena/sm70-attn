@@ -1,4 +1,26 @@
+<div align="center">
+
 # sm70-attn
+
+**FlashAttention brought back to Tesla V100 — a deep llama.cpp fork**
+
+An SM 7.0 (V100) CUDA kernel plugin for Qwen3.5/3.6/3.8-27B
+(head_dim=256, GQA 6:1, 16 full-attention layers), plus DFlash2
+speculative decoding and multimodal fixes.
+
+![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia&logoColor=white)
+![SM](https://img.shields.io/badge/SM_7.0-Volta-76B900?logo=nvidia&logoColor=white)
+![FA](https://img.shields.io/badge/FlashAttention-D256%20Split--D-3b82f6)
+![SplitKV3](https://img.shields.io/badge/KV%20Split-3--way-22c55e)
+![KV](https://img.shields.io/badge/KV%20Cache-q4_0%20%2B%20f16-f97316)
+![Perf](https://img.shields.io/badge/176k%20prefill-%2B42.9%25-16a34a)
+![Gates](https://img.shields.io/badge/harness-23%2F23%20PASS-6366f1)
+
+**English** · [中文](README-sm70.zh.md)
+
+</div>
+
+---
 
 Private fork of llama.cpp carrying a SM70 (V100) D256 flash-attention plugin for
 Qwen3.5/3.6/3.8-27B (head_dim=256, GQA 6:1, 16 full-attention layers).
