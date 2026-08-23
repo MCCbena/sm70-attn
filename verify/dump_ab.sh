@@ -27,7 +27,17 @@ OFF=/tmp/sm70_dump_off.bin
 [ -x "$BIN" ] || { echo "ERROR: $BIN 不存在, 先: cmake --build build -j"; exit 1; }
 [ -f "$MODEL" ] || { echo "ERROR: model 不存在: $MODEL"; exit 1; }
 [ -f "$PROMPT" ] || { echo "ERROR: $PROMPT 不存在"; exit 1; }
-command -v python3 > /dev/null || { echo "ERROR: python3 not found"; exit 1; }
+
+# python 选择: 优先 conda (带 numpy), 退回 python3
+PY=python3
+for cand in "$HOME/miniconda3/bin/python" "$HOME/anaconda3/bin/python"; do
+    if [ -x "$cand" ] && "$cand" -c "import numpy" 2>/dev/null; then
+        PY="$cand"
+        break
+    fi
+done
+"$PY" -c "import numpy" 2>/dev/null || { echo "ERROR: numpy 不可用 ($PY)"; exit 1; }
+echo "python: $PY"
 
 # GPU 必须空闲
 if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q .; then
@@ -112,7 +122,7 @@ stop_server
 echo
 echo "=== layerwise diff analysis ==="
 ls -la "$ON" "$OFF" || true
-python3 verify/sm70_layer_diff.py --a "$ON" --b "$OFF" --csv /tmp/sm70_layer_diff.csv
+"$PY" verify/sm70_layer_diff.py --a "$ON" --b "$OFF" --csv /tmp/sm70_layer_diff.csv
 echo
 echo "done. csv -> /tmp/sm70_layer_diff.csv   dumps -> $ON $OFF"
 echo "(server log: /tmp/sm70_dump_server.log)"

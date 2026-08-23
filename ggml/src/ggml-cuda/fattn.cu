@@ -667,13 +667,17 @@ static void sm70_dump_attn_output(ggml_backend_cuda_context & ctx, const ggml_te
         }
     }
     const size_t nbytes = ggml_nbytes(dst);
-    const uint32_t hdr[8] = {
+    // 10 x u32 = 8 header fields + nbytes as two little-endian halves,
+    // matching struct '<8IQ' (40 bytes) in sm70_layer_diff.py.
+    const uint32_t hdr[10] = {
         0x53444D37u, // magic
         1u,          // version
         (uint32_t) calls,
         (uint32_t) Q->ne[1],
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
         (uint32_t) dst->ne[2], (uint32_t) dst->ne[3],
+        (uint32_t) ((uint64_t) nbytes & 0xFFFFFFFFu),
+        (uint32_t) ((uint64_t) nbytes >> 32),
     };
     static std::vector<uint8_t> buf;
     if (buf.size() < sizeof(hdr) + nbytes) {
