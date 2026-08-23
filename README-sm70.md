@@ -58,7 +58,25 @@ staging costs ~0.1s of a 770s 176k prefill (28.7GB of traffic), not minutes.
 Meanwhile the narrow loads make the attention kernel itself 3.6% slower at
 176k (457 vs 474 tok/s). Net: the opt-in trades ~4% prefill speed for ~470MB
 of VRAM (the f16 mirror at `-c 229k`) — only worth it when memory-bound.
-Erratum recorded in `verify/1cat-portability-study-20260823.md`.
+
+## Upstream (1Cat-vLLM) status: exhausted (8/24)
+
+Decision-grade measurements that closed the portability question (the full
+8/23 study was deleted 8/24 once nothing actionable remained):
+
+- **Prefill kernels**: Split-D vendored + fixed + splitkv3 — eaten clean.
+  `_full` variant is a no-split simplification, nothing new.
+- **XQA decode kernel (3490 lines)**: NOT ported, measured irrelevant —
+  decode is model-forward bound on this GPU: tg64 @ ctx 0 = 28.99 tok/s,
+  @ ctx 8192 = 29.06 tok/s. KV read is 24us of a 34ms step (<0.1%); even
+  176k context is ~1.5%. Porting paged-KV/CUDA-graph machinery for that
+  is a dead trade.
+- **TurboQuant / FP8 KV / paged layout converters**: private quant formats
+  and vLLM-specific infrastructure, not portable at kernel level.
+- **flash_qla (GDN linear attention)**: the only open thread — gated on
+  measuring GDN layer time share first (profiling workstream, not a port).
+- **smem bank-padding know-how** (264/272-style constants): our vendor
+  kernel already ships pitch-68 + Swizzle<3,3,3> + TT-swizzled V layouts.
 
 ## The 8/23 stride fix (root cause of the "context contamination")
 
