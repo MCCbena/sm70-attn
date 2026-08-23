@@ -20,10 +20,10 @@ BIN=build/bin/llama-server
 MODEL=$HOME/models/qwen3.8-27b-ud-q4kxl/Qwen3.8-27B-UD-Q4_K_XL.gguf
 MMPROJ=$HOME/models/qwen3.8-27b-ud-q6k/mmproj-BF16.gguf
 DRAFT=$HOME/models/qwen3.8-dflash/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
-PROMPT=verify/dump_prompt.txt
+PROMPT="${PROMPT:-verify/dump_prompt.txt}"
 PORT=8090
-ON=/tmp/sm70_dump_on.bin
-OFF=/tmp/sm70_dump_off.bin
+ON="${ON_DUMP:-/tmp/sm70_dump_on.bin}"
+OFF="${OFF_DUMP:-/tmp/sm70_dump_off.bin}"
 
 [ -x "$BIN" ] || { echo "ERROR: $BIN 不存在, 先: cmake --build build -j"; exit 1; }
 [ -f "$MODEL" ] || { echo "ERROR: model 不存在: $MODEL"; exit 1; }
