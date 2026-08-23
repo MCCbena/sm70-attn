@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 BIN=build/bin/llama-server
 MODEL=$HOME/models/qwen3.8-27b-ud-q4kxl/Qwen3.8-27B-UD-Q4_K_XL.gguf
-PROMPT=verify/dump_prompt.txt
+PROMPT="${PROMPT:-verify/dump_prompt.txt}"
 OUT=/tmp/sm70_dump_cpu.bin
 LOG=/tmp/sm70_dump_cpu_server.log
 
