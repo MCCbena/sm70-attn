@@ -390,6 +390,99 @@ __device__ __forceinline__ void splitd_n32_online_softmax(
     }
 }
 
+// ---------------------------------------------------------------------------
+// q4_0 in-kernel dequant (8/23 q4-direct port).
+//
+// Block layout: [f16 scale (2B)][32 x 4-bit quants (16B)] = 18B per 32 dims.
+// Addressing under Kq4/Vq4: row_base = cache + token*k_row_stride + 
+// head*k_head_stride (byte strides, [ctx][head][block] pos-major); element d
+// lives in block (d>>5) at byte 2 + ((d&31)>>1), low nibble for even d.
+//
+// Rounding parity with the staged path (ggml-cuda/convert.cu
+// dequantize_block_q4_0): value = d*(q-8) with d in f32 — the product of an
+// 11-bit and a 4-bit mantissa is exact in f32 — rounded once to half.
+// __hmul2-based ggml kernels round the same exact product, so all three
+// paths produce identical f16 bits.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ __half sm70_q4_dequant_one(
+        const uint8_t * __restrict__ row_base, const int d) {
+    const uint8_t * b = row_base + (d >> 5) * 18;
+    const float s = __half2float(*reinterpret_cast<const __half *>(b));
+    const uint8_t pair = b[2 + ((d & 31) >> 1)];
+    const int q = (d & 1) ? (pair >> 4) : (pair & 0x0F);
+    return __float2half_rn(((float) q - 8.0f) * s);
+}
+
+// Dequant kGrp (4 or 8) consecutive elements starting at d (4-/8-aligned, so
+// they never straddle a block). Nibbles come from one (kGrp==4) or two
+// (kGrp==8) aligned u16 loads; block+scale addressing is derived once per
+// group — the #268-style amortization applied to block addressing.
+template <int kGrp>
+__device__ __forceinline__ void sm70_q4_dequant_group(
+        const uint8_t * __restrict__ row_base, const int d, __half out[kGrp]) {
+    static_assert(kGrp == 4 || kGrp == 8, "group must be 4 or 8");
+    const uint8_t * b = row_base + (d >> 5) * 18;
+    const float s = __half2float(*reinterpret_cast<const __half *>(b));
+    const int off = 2 + ((d & 31) >> 1);
+    uint32_t nib;
+    if constexpr (kGrp == 4) {
+        nib = *reinterpret_cast<const uint16_t *>(b + off);
+    } else {
+        nib = (uint32_t) *reinterpret_cast<const uint16_t *>(b + off)
+            | ((uint32_t) *reinterpret_cast<const uint16_t *>(b + off + 2) << 16);
+    }
+#pragma unroll
+    for (int j = 0; j < kGrp; ++j) {
+        out[j] = __float2half_rn(((float) ((nib >> (4 * j)) & 0xF) - 8.0f) * s);
+    }
+}
+
+// Fill a K/V fragment (register fragment or smem partition — anything with
+// frag(i) assignment) from the raw q4_0 cache. `coords` is the identity-
+// tensor partition over the (kBlockN, kDChunk) tile made with the SAME
+// gmem thread slice (the tVcV pattern), so the fill is layout-agnostic.
+// kGrp is the tiled copy's value-group size (K: Shape<_1,_4> -> 4 consecutive
+// cols; V: Shape<_1,_8> -> 8). Consecutiveness is verified at runtime and
+// falls back to per-element dequant if the assumption ever breaks.
+template <int kGrp, typename FragT, typename CoordT>
+__device__ __forceinline__ void sm70_q4_fill_kv(
+        const uint8_t * __restrict__ head_base,
+        const int64_t row_stride,
+        const int token0,
+        const int d_chunk,
+        FragT & frag,
+        const CoordT & coords) {
+    constexpr int kDChunk = Sm70D256SplitDTraits::kDChunk;
+#pragma unroll
+    for (int i = 0; i < size(frag); i += kGrp) {
+        const int row = get<0>(coords(i));
+        const int col = get<1>(coords(i));
+        bool consec = true;
+#pragma unroll
+        for (int j = 1; j < kGrp; ++j) {
+            consec = consec && get<0>(coords(i + j)) == row
+                            && get<1>(coords(i + j)) == col + j;
+        }
+        const uint8_t * row_base = head_base
+            + static_cast<int64_t>(token0 + row) * row_stride;
+        const int d = d_chunk * kDChunk + col;
+        __half tmp[kGrp];
+        if (consec) {
+            sm70_q4_dequant_group<kGrp>(row_base, d, tmp);
+        } else {
+#pragma unroll
+            for (int j = 0; j < kGrp; ++j) {
+                tmp[j] = sm70_q4_dequant_one(row_base, d + j);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kGrp; ++j) {
+            frag(i + j) = tmp[j];
+        }
+    }
+}
+
 template <int kThreadsPerRow, int kRowsPerThread, int kElemsPerLoad>
 __device__ __forceinline__ int64_t paged_kv_thread_offset(
     int tid,
@@ -415,7 +508,22 @@ __device__ __forceinline__ int64_t paged_kv_thread_offset(
 // (the f16 output staging was a per-layer rounding source; see 8/23 review).
 // Q/K/V must stay f16 (HMMA operand constraint). Upstream-deviation note:
 // template parameter + the single `out[offset] = ElementOut(...)` store below.
-template <typename Element, bool PagedKV, typename ElementOut = Element, bool SplitKV3 = false>
+//
+// Kq4/Vq4 (8/23 q4-direct port, from the 1Cat XQA load_xqa_tc_kv_vector
+// <KV_DTYPE> architecture): when set, the `k`/`v` args point at the RAW q4_0
+// block cache (byte pointer) and k/v row/head strides are BYTES — layout
+// [ctx][head][block], 8 blocks x 18B per 256-d row (nb[1] = ctx stride,
+// nb[2] = head stride). The kernel dequantizes straight into the register
+// fragments / smem panels, replacing the whole-cache to_fp16 staging pass
+// (which re-dequantized the entire cache on EVERY prefill chunk — O(n^2)
+// traffic for chunked server prefill). Rounding is bit-identical to the
+// staged path (convert.cu dequantize_block_q4_0: d*(q-8) exact in f32, one
+// RN to half). Loads amortize the block/scale address derivation per
+// 4/8-element group (the #268 wide-load idea adapted: no page tables here,
+// so the amortization is block addressing, and nibble pairs are read as
+// aligned u16s). Dense path only (static_assert against PagedKV).
+template <typename Element, bool PagedKV, typename ElementOut = Element, bool SplitKV3 = false,
+          bool Kq4 = false, bool Vq4 = false>
 __global__ __launch_bounds__(Sm70D256SplitDTraits::kNThreads, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
@@ -444,6 +552,8 @@ void sm70_d256_splitd_dense_kernel(
     float *__restrict__ partial_max,
     float *__restrict__ partial_sum) {
     using Traits = Sm70D256SplitDTraits;
+    static_assert(!(PagedKV && (Kq4 || Vq4)),
+                  "q4-direct implements the dense (non-paged) path only");
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
     constexpr int kDChunk = Traits::kDChunk;
@@ -551,6 +661,18 @@ void sm70_d256_splitd_dense_kernel(
         ? 0
         : static_cast<int64_t>(batch)
             * k_outer_stride;
+    // q4-direct: hoisted per-CTA head base (byte pointer). Under Kq4/Vq4 the
+    // k/v args are raw block bytes and the row/head strides are BYTES
+    // ([ctx][head][block]); per-tile addressing reduces to
+    // head_base + (n_block*kBlockN + row) * row_stride.
+    const uint8_t * k_q4_head_base = Kq4
+        ? reinterpret_cast<const uint8_t *>(k)
+              + static_cast<int64_t>(head_kv) * k_head_stride
+        : nullptr;
+    const uint8_t * v_q4_head_base = Vq4
+        ? reinterpret_cast<const uint8_t *>(v)
+              + static_cast<int64_t>(head_kv) * v_head_stride
+        : nullptr;
     auto mK = make_tensor(
         make_gmem_ptr(k + k_batch_offset + head_kv * k_head_stride),
         make_shape(kv_len, Int<Traits::kHeadDim>{}),
@@ -560,24 +682,34 @@ void sm70_d256_splitd_dense_kernel(
     auto tKsKRaw = gmem_k_thread.partition_D(sK);
     auto tKsK = reshape_kv_thread_tensor<PagedKV>(tKsKRaw);
     auto tKrKNext = make_fragment_like(tKsK);
-    auto gKFirst = local_tile(
-        mK,
-        Shape<Int<kBlockN>, Int<kDChunk>>{},
-        make_coord(n_block_first, 0));
-    auto tKgKFirstRaw = gmem_k_thread.partition_S(gKFirst);
-    auto tKgKFirst = reshape_kv_thread_tensor<PagedKV>(tKgKFirstRaw);
-    int64_t k_thread_tile_base = 0;
-    if constexpr (PagedKV) {
-        k_thread_tile_base = paged_kv_thread_offset<
-            Traits::kGmemKThreadsPerRow,
-            Traits::kGmemKRowsPerThread,
-            Traits::kGmemKElemsPerLoad>(
-                tid, n_block_first, 0, page_size, sequence_block_table,
-                k_outer_stride,
-                k_row_stride);
-        tKgKFirst.data() = mK.data() + k_thread_tile_base;
+    // Identity coords over the (kBlockN, kDChunk) K tile — same thread slice
+    // as tKsK/tKrKNext, so tKcK(i) gives the (row, col) of fragment index i
+    // (the tVcV pattern). Drives the q4-direct fills.
+    auto cK = make_identity_tensor(Shape<Int<kBlockN>, Int<kDChunk>>{});
+    auto tKcK = gmem_k_thread.partition_S(cK);
+    if constexpr (Kq4) {
+        sm70_q4_fill_kv<4>(k_q4_head_base, k_row_stride,
+                           n_block_first * kBlockN, 0, tKsK, tKcK);
+    } else {
+        auto gKFirst = local_tile(
+            mK,
+            Shape<Int<kBlockN>, Int<kDChunk>>{},
+            make_coord(n_block_first, 0));
+        auto tKgKFirstRaw = gmem_k_thread.partition_S(gKFirst);
+        auto tKgKFirst = reshape_kv_thread_tensor<PagedKV>(tKgKFirstRaw);
+        int64_t k_thread_tile_base = 0;
+        if constexpr (PagedKV) {
+            k_thread_tile_base = paged_kv_thread_offset<
+                Traits::kGmemKThreadsPerRow,
+                Traits::kGmemKRowsPerThread,
+                Traits::kGmemKElemsPerLoad>(
+                    tid, n_block_first, 0, page_size, sequence_block_table,
+                    k_outer_stride,
+                    k_row_stride);
+            tKgKFirst.data() = mK.data() + k_thread_tile_base;
+        }
+        copy_even_tile(gmem_k_copy, tKgKFirst, tKsK);
     }
-    copy_even_tile(gmem_k_copy, tKgKFirst, tKsK);
     __syncthreads();
 
     for (int n_block = n_block_max; n_block >= n_block_min; --n_block) {
@@ -593,19 +725,31 @@ void sm70_d256_splitd_dense_kernel(
 #pragma unroll
         for (int d_chunk = 0; d_chunk < Traits::kDChunks; ++d_chunk) {
             if (d_chunk + 1 < Traits::kDChunks) {
-                auto gKNext = local_tile(
-                    mK,
-                    Shape<Int<kBlockN>, Int<kDChunk>>{},
-                    make_coord(n_block, d_chunk + 1));
-                auto tKgKNextRaw = gmem_k_thread.partition_S(gKNext);
-                auto tKgKNext =
-                    reshape_kv_thread_tensor<PagedKV>(tKgKNextRaw);
-                if constexpr (PagedKV) {
-                    tKgKNext.data() = mK.data()
-                        + k_thread_tile_base
-                        + (d_chunk + 1) * kDChunk;
+                if constexpr (Kq4) {
+                    sm70_q4_fill_kv<4>(k_q4_head_base, k_row_stride,
+                                       n_block * kBlockN, d_chunk + 1,
+                                       tKrKNext, tKcK);
+                } else {
+                    auto gKNext = local_tile(
+                        mK,
+                        Shape<Int<kBlockN>, Int<kDChunk>>{},
+                        make_coord(n_block, d_chunk + 1));
+                    auto tKgKNextRaw = gmem_k_thread.partition_S(gKNext);
+                    auto tKgKNext =
+                        reshape_kv_thread_tensor<PagedKV>(tKgKNextRaw);
+                    if constexpr (PagedKV) {
+                        tKgKNext.data() = mK.data()
+                            + paged_kv_thread_offset<
+                                  Traits::kGmemKThreadsPerRow,
+                                  Traits::kGmemKRowsPerThread,
+                                  Traits::kGmemKElemsPerLoad>(
+                                  tid, n_block, 0, page_size,
+                                  sequence_block_table, k_outer_stride,
+                                  k_row_stride)
+                            + (d_chunk + 1) * kDChunk;
+                    }
+                    copy_even_tile(gmem_k_copy, tKgKNext, tKrKNext);
                 }
-                copy_even_tile(gmem_k_copy, tKgKNext, tKrKNext);
             }
 
             auto sQChunk = local_tile(
@@ -672,21 +816,29 @@ void sm70_d256_splitd_dense_kernel(
         auto tVgV2Raw = gmem_v_thread.partition_S(gV2);
         auto tVgV0 = reshape_kv_thread_tensor<PagedKV>(tVgV0Raw);
         auto tVgV2 = reshape_kv_thread_tensor<PagedKV>(tVgV2Raw);
-        int64_t v_thread_tile_base = 0;
-        if constexpr (PagedKV) {
-            v_thread_tile_base = paged_kv_thread_offset<
-                Traits::kGmemThreadsPerRow,
-                Traits::kGmemRowsPerThread,
-                Traits::kGmemElemsPerLoad>(
-                    tid, n_block, 0, page_size, sequence_block_table,
-                    v_outer_stride, v_row_stride);
-            tVgV0.data() = mV.data() + v_thread_tile_base;
-            tVgV2.data() = mV.data()
-                + v_thread_tile_base
-                + Traits::kOwnedDChunks * kDChunk;
+        if constexpr (Vq4) {
+            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+                               n_block * kBlockN, 0, tVrV0, tVcV);
+            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+                               n_block * kBlockN, Traits::kOwnedDChunks,
+                               tVrV1, tVcV);
+        } else {
+            int64_t v_thread_tile_base = 0;
+            if constexpr (PagedKV) {
+                v_thread_tile_base = paged_kv_thread_offset<
+                    Traits::kGmemThreadsPerRow,
+                    Traits::kGmemRowsPerThread,
+                    Traits::kGmemElemsPerLoad>(
+                        tid, n_block, 0, page_size, sequence_block_table,
+                        v_outer_stride, v_row_stride);
+                tVgV0.data() = mV.data() + v_thread_tile_base;
+                tVgV2.data() = mV.data()
+                    + v_thread_tile_base
+                    + Traits::kOwnedDChunks * kDChunk;
+            }
+            copy_even_tile(gmem_v_copy, tVgV0, tVrV0);
+            copy_even_tile(gmem_v_copy, tVgV2, tVrV1);
         }
-        copy_even_tile(gmem_v_copy, tVgV0, tVrV0);
-        copy_even_tile(gmem_v_copy, tVgV2, tVrV1);
 
         FLASH_NAMESPACE::Mask<true, false, false> mask(
             kv_len, kv_len - kv_offset, -1, 0, 0.0f);
@@ -732,15 +884,34 @@ void sm70_d256_splitd_dense_kernel(
         auto tVgV3Raw = gmem_v_thread.partition_S(gV3);
         auto tVgV1 = reshape_kv_thread_tensor<PagedKV>(tVgV1Raw);
         auto tVgV3 = reshape_kv_thread_tensor<PagedKV>(tVgV3Raw);
-        if constexpr (PagedKV) {
-            tVgV1.data() = mV.data()
-                + v_thread_tile_base + kDChunk;
-            tVgV3.data() = mV.data()
-                + v_thread_tile_base
-                + (Traits::kOwnedDChunks + 1) * kDChunk;
+        if constexpr (Vq4) {
+            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+                               n_block * kBlockN, 1, tVrV0, tVcV);
+            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+                               n_block * kBlockN,
+                               Traits::kOwnedDChunks + 1, tVrV1, tVcV);
+        } else {
+            if constexpr (PagedKV) {
+                tVgV1.data() = mV.data()
+                    + paged_kv_thread_offset<
+                          Traits::kGmemThreadsPerRow,
+                          Traits::kGmemRowsPerThread,
+                          Traits::kGmemElemsPerLoad>(
+                          tid, n_block, 0, page_size,
+                          sequence_block_table, v_outer_stride, v_row_stride)
+                    + kDChunk;
+                tVgV3.data() = mV.data()
+                    + paged_kv_thread_offset<
+                          Traits::kGmemThreadsPerRow,
+                          Traits::kGmemRowsPerThread,
+                          Traits::kGmemElemsPerLoad>(
+                          tid, n_block, 0, page_size,
+                          sequence_block_table, v_outer_stride, v_row_stride)
+                    + (Traits::kOwnedDChunks + 1) * kDChunk;
+            }
+            copy_even_tile(gmem_v_copy, tVgV1, tVrV0);
+            copy_even_tile(gmem_v_copy, tVgV3, tVrV1);
         }
-        copy_even_tile(gmem_v_copy, tVgV1, tVrV0);
-        copy_even_tile(gmem_v_copy, tVgV3, tVrV1);
 
         auto sPGroup = local_tile(
             sP,
@@ -777,29 +948,33 @@ void sm70_d256_splitd_dense_kernel(
                 store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
                 __syncthreads();
                 if (n_block > n_block_min) {
-                    auto gKNextBlock = local_tile(
-                        mK,
-                        Shape<Int<kBlockN>, Int<kDChunk>>{},
-                        make_coord(n_block - 1, 0));
-                    auto tKgKNextBlockRaw =
-                        gmem_k_thread.partition_S(gKNextBlock);
-                    auto tKgKNextBlock =
-                        reshape_kv_thread_tensor<PagedKV>(
-                            tKgKNextBlockRaw);
-                    if constexpr (PagedKV) {
-                        k_thread_tile_base = paged_kv_thread_offset<
-                            Traits::kGmemKThreadsPerRow,
-                            Traits::kGmemKRowsPerThread,
-                            Traits::kGmemKElemsPerLoad>(
-                                tid, n_block - 1, 0, page_size,
-                                sequence_block_table,
-                                k_outer_stride,
-                                k_row_stride);
-                        tKgKNextBlock.data() =
-                            mK.data() + k_thread_tile_base;
+                    if constexpr (Kq4) {
+                        sm70_q4_fill_kv<4>(
+                            k_q4_head_base, k_row_stride,
+                            (n_block - 1) * kBlockN, 0, tKrKNext, tKcK);
+                    } else {
+                        auto gKNextBlock = local_tile(
+                            mK,
+                            Shape<Int<kBlockN>, Int<kDChunk>>{},
+                            make_coord(n_block - 1, 0));
+                        auto tKgKNextBlockRaw =
+                            gmem_k_thread.partition_S(gKNextBlock);
+                        auto tKgKNextBlock =
+                            reshape_kv_thread_tensor<PagedKV>(
+                                tKgKNextBlockRaw);
+                        if constexpr (PagedKV) {
+                            tKgKNextBlock.data() = mK.data()
+                                + paged_kv_thread_offset<
+                                      Traits::kGmemKThreadsPerRow,
+                                      Traits::kGmemKRowsPerThread,
+                                      Traits::kGmemKElemsPerLoad>(
+                                      tid, n_block - 1, 0, page_size,
+                                      sequence_block_table, k_outer_stride,
+                                      k_row_stride);
+                        }
+                        copy_even_tile(
+                            gmem_k_copy, tKgKNextBlock, tKrKNext);
                     }
-                    copy_even_tile(
-                        gmem_k_copy, tKgKNextBlock, tKrKNext);
                 }
             }
         }

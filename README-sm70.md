@@ -40,6 +40,25 @@ Qwen3.5/3.6/3.8-27B (head_dim=256, GQA 6:1, 16 full-attention layers).
 - `LLAMA_SM70_D256=0` in the environment disables the hook without rebuilding.
 - `LLAMA_SM70_SPLITKV3_MIN_KV=<n>` - SplitKV3 activation threshold on kv_len
   (default 2048; `0` disables SplitKV3 entirely).
+- `LLAMA_SM70_D256_Q4_DIRECT=1` - opt in to in-kernel q4_0 dequant loads
+  (see the 8/24 section; default OFF — staged is faster).
+
+## q4-direct: in-kernel q4_0 loads (8/24, from the 1Cat XQA architecture)
+
+The kernel gained `Kq4/Vq4` template branches that read the RAW q4_0 block
+cache (`[ctx][head][block]`, byte strides) and dequant straight into the
+register fragments / smem panels (4/8-element groups, amortized block
+addressing, aligned u16 nibble loads). Rounding is bit-identical to the
+staged `to_fp16` path (exact f32 product + one RN), verified by harness
+(`q4K-pV`/`q4KV`/`q4K-s3`, 23/23) and the logit A/B (`verify/logit_q4direct.sh`).
+
+**Why default OFF** (measured 8/24, V100, q4_0 K + f16 V): the study that
+motivated the port contained a 1000x units error — the whole-cache dequant
+staging costs ~0.1s of a 770s 176k prefill (28.7GB of traffic), not minutes.
+Meanwhile the narrow loads make the attention kernel itself 3.6% slower at
+176k (457 vs 474 tok/s). Net: the opt-in trades ~4% prefill speed for ~470MB
+of VRAM (the f16 mirror at `-c 229k`) — only worth it when memory-bound.
+Erratum recorded in `verify/1cat-portability-study-20260823.md`.
 
 ## The 8/23 stride fix (root cause of the "context contamination")
 
@@ -84,6 +103,9 @@ instantiation to keep `(-inf)-(-inf)=NaN` out of the partial chain.
 - NEW G4 (8/23): harness `verify/sm70_verify` — 19 cases, 0 failing
   (dense / f32-out / spiky / pos-major K,V / SplitKV3 incl. empty-segment
   edge).
+  **8/24: extended to 23 cases — `q4K-pV` (full production geometry with
+  direct q4_0 K + paged f16 V), `q4KV-279/3000`, `q4K-s3`; all at the f16
+  noise floor (~1.7e-4), confirming bit-parity of the in-kernel dequant.**
 - NEW G5 (8/23): three-way dump verdict — first-layer ON-vs-OFF must be at
   the f16 rounding floor (~5e-4 dense, ~3e-3 splitkv3) and layer-avg
   |A-C| == |B-C| (equal distance to the CPU f32 reference). See Tooling.

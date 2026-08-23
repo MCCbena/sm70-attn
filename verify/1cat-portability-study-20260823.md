@@ -45,14 +45,26 @@ CUDA Graph 变体、batch/context 路由）到 llama.cpp 的连续 KV 布局上�
 
 ### 1. 核内 q4_0 直读（省掉整缓存去量化 staging）— 最高优先级
 
+> **8/24 重大勘误**：本节最初的量化估算存在千倍量级换算错误（GB 被当成了
+> TB 级时间）。正确账目：32k chunked 去量化总流量 ≈ 173GB ≈ **0.2s**；
+> 176k 单发 ≈ 28.7GB ≈ **0.1s**；176k 服务端 chunked 最坏情形 4.9TB ≈
+> **5.5s**（占 ~1-3%）。实测证实：q4-direct 与 staged 在 8k/32k 下差距
+> 在噪声内（±1%），stock 路径 q4_0 K 比 f16 K 慢 4.5%（主要是 tile
+> kernel 读 2× 体积，非去量化本身）。**去量化 staging 从来不是有意义的
+> 开销**。移植仍然完成（数值逐位等价，23/23 回归通过），但其价值修正为：
+> 消除 f16 镜像分配（长 ctx 数百 MB VRAM）+ 少一类 kernel，而非性能。
+> 详见 8/24 实施记录。
+
 现状（`fattn-sm70-d256.cu` 的 `sm70_d256_dequant_kv`，stock 路径同罪）：
 每次 flash_attn 调用把**整个 K/V 缓存**去量化成 f16 extra buffer：
 
-- llama-bench 单次大 prompt：每层一次性 dequant 176k 缓存 = 101MB 读 +
-  361MB 写 × 62 层 ≈ 28.6GB 额外流量 ≈ 32s（约占 405s prefill 的 8%）
-- **服务端 chunked prefill（ub=512）更糟**：每个 chunk 每层都重新 dequant
+- ~~llama-bench 单次大 prompt：每层一次性 dequant 176k 缓存 = 101MB 读 +
+  361MB 写 × 62 层 ≈ 28.6GB 额外流量 ≈ 32s（约占 405s prefill 的 8%）~~
+  **（勘误：28.6GB ÷ 900GB/s ≈ 0.03s，占 0.008%）**
+- ~~服务端 chunked prefill（ub=512）更糟：每个 chunk 每层都重新 dequant
   整个已增长的缓存，长上下文下趋于 O(n²)——这是 stock llama.cpp 量化 KV
-  长上下文 prefill 的经典痛点，我们的 kernel 继承了它
+  长上下文 prefill 的经典痛点，我们的 kernel 继承了它~~
+  **（勘误：O(n²) 流量确实存在（4.9TB @ 176k）但换算后仅 ~5.5s / 1-3%）**
 
 上游给的法门：XQA kernel 的 `load_xqa_tc_kv_vector<KV_DTYPE>` 把
 "按 dtype 加载 KV 进 smem panel"做成模板特化（FP16 直接 uint4 加载、
@@ -63,7 +75,8 @@ kernel 只需读 101MB 而不是 462MB（读+写+再读），且 chunked prefill
 
 工作量：kernel 加载路径改造（一个模板分支 + q4_0 解码函数，
 模式在 stock `fattn-tile` 的核内 dequant 里现成）+ launcher 删 staging
-分支。收益：长上下文 prefill 8%（单发）到数倍（服务端 chunked）。
+分支。~~收益：长上下文 prefill 8%（单发）到数倍（服务端 chunked）。~~
+**（勘误后实际收益：~0%（性能）；省 f16 镜像显存数百 MB + 减一类 kernel。）**
 
 ### 2. smem bank 冲突 padding 常量 — 顺手带走
 

@@ -45,6 +45,42 @@ static float frand() {
     return (float)(s_rng >> 8) / 8388608.0f - 1.0f;
 }
 
+// ---------------------------------------------------------------------------
+// q4_0 helpers (8/23 q4-direct regression cases): ggml reference quantizer +
+// kernel-parity dequant (exact f32 product, one RN to half — identical to
+// convert.cu dequantize_block_q4_0 and the in-kernel sm70_q4_dequant_*).
+// Block: [f16 scale 2B][32 x 4-bit quants 16B]; row = 8 blocks = 144B.
+// ---------------------------------------------------------------------------
+static void quant_row_q4_0(const float * x, uint8_t * y, int k) {
+    for (int i = 0; i < k / 32; ++i) {
+        float amax = 0.0f, mx = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            const float v = x[i * 32 + j];
+            if (amax < fabsf(v)) { amax = fabsf(v); mx = v; }
+        }
+        const float d = mx / -8.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const __half dh = __float2half(d);
+        memcpy(y + i * 18, &dh, 2);
+        for (int j = 0; j < 16; ++j) {
+            const float x0 = x[i * 32 + j] * id;
+            const float x1 = x[i * 32 + 16 + j] * id;
+            const uint8_t q0 = (uint8_t) std::min(15, (int) (x0 + 8.5f));
+            const uint8_t q1 = (uint8_t) std::min(15, (int) (x1 + 8.5f));
+            y[i * 18 + 2 + j] = (uint8_t) (q0 | (q1 << 4));
+        }
+    }
+}
+
+static float deq_q4_one(const uint8_t * row_base, int d) {
+    const uint8_t * b = row_base + (d >> 5) * 18;
+    __half s;
+    memcpy(&s, b, 2);
+    const uint8_t pair = b[2 + ((d & 31) >> 1)];
+    const int q = (d & 1) ? (pair >> 4) : (pair & 0x0F);
+    return __half2float(__float2half_rn(((float) q - 8.0f) * __half2float(s)));
+}
+
 // CPU f32 reference for ONE (batch, q-head, q-row): dot with each kv col,
 // online-softmax-safe (scale in raw space, exp2 parity with kernel).
 static std::vector<float> ref_row(const float* q_row, const float* k, const float* v,
@@ -79,7 +115,9 @@ struct Case { const char* name; int nb, kvlen, q_len; bool sample;
               bool f32out = false;      // true = ElementOut=float kernel (production since 8/23)
               float amp = 1.0f;         // input amplitude: >1 spikes QK logits (softmax sharpness probe)
               bool k_posmajor = false;  // true = production to_fp16 dequant K layout (pos-major, 8/23 fix)
-              bool splitkv3 = false; }; // true = 3-way KV split + merge path (8/23 port; implies f32out)
+              bool splitkv3 = false;    // true = 3-way KV split + merge path (8/23 port; implies f32out)
+              bool k_q4 = false;        // true = raw q4_0 K cache, in-kernel dequant (8/23 q4-direct)
+              bool v_q4 = false; };     // true = raw q4_0 V cache, in-kernel dequant
 
 static int run_case(const Case& tc, bool oob) {
     const int nb = tc.nb, kvlen = tc.kvlen, q_len = tc.q_len;
@@ -107,7 +145,13 @@ static int run_case(const Case& tc, bool oob) {
     for (size_t i = 0; i < Kf.size(); ++i) Kqf[i] = __half2float(__float2half(Kf[i]));
     for (size_t i = 0; i < Vf.size(); ++i) Vqf[i] = __half2float(__float2half(Vf[i]));
 
-    const int kv_alloc_rows = oob ? kvlen : kvlen + 3;
+    // Normal mode headroom: the kernel's last visible N-tile legitimately
+    // reads up to 31 rows past kv_len (production reads stale-but-valid cache
+    // capacity there; causally masked). Round the headroom up to a full tile
+    // and zero it, so the garbage read is DETERMINISTIC — raw cudaMalloc
+    // garbage can contain NaN/Inf f16 patterns that turn p=0 * V into NaN
+    // (bit the q4K-s3 case on 8/23: heap-layout luck made f16 cases pass).
+    const int kv_alloc_rows = oob ? kvlen : ((kvlen + 31) & ~31) + 32;
     std::vector<__half> Qh(Qf.size()), Kh((size_t) nb * hkv * kv_alloc_rows * D), Vh((size_t) nb * hkv * kv_alloc_rows * D);
     for (size_t i = 0; i < Qf.size(); ++i) Qh[i] = __float2half(Qf[i]);
     // K device buffer layout MUST match the strides handed to the kernel:
@@ -162,24 +206,73 @@ static int run_case(const Case& tc, bool oob) {
         }
     }
 
+    // q4_0 caches (k_q4/v_q4): [b][ctx][hkv][8 blocks x 18B] pos-major — the
+    // production raw -ctk/-ctv q4_0 geometry the q4-direct kernel reads
+    // (row stride = hkv*144 bytes, head stride = 144 bytes). Quantized from
+    // the f32 sources with the ggml reference quantizer; the CPU reference
+    // is then re-based on the f16-rounded dequantized values (exactly what
+    // the kernel produces in-kernel — same rounding formula).
+    std::vector<uint8_t> Kq4b, Vq4b;
+    if (tc.k_q4) {
+        Kq4b.assign((size_t) nb * kv_alloc_rows * hkv * 144, 0);
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j)
+                    quant_row_q4_0(&Kf[(((size_t) (b * hkv + j) * kvlen + c) * D)],
+                                   &Kq4b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 144)], D);
+        for (size_t i = 0; i < Kqf.size(); ++i) Kqf[i] = 0.0f;
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j) {
+                    const uint8_t * row = &Kq4b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 144)];
+                    for (int d = 0; d < D; ++d)
+                        Kqf[(((size_t) (b * hkv + j) * kvlen + c) * D) + d] = deq_q4_one(row, d);
+                }
+    }
+    if (tc.v_q4) {
+        Vq4b.assign((size_t) nb * kv_alloc_rows * hkv * 144, 0);
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j)
+                    quant_row_q4_0(&Vf[(((size_t) (b * hkv + j) * kvlen + c) * D)],
+                                   &Vq4b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 144)], D);
+        for (size_t i = 0; i < Vqf.size(); ++i) Vqf[i] = 0.0f;
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j) {
+                    const uint8_t * row = &Vq4b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 144)];
+                    for (int d = 0; d < D; ++d)
+                        Vqf[(((size_t) (b * hkv + j) * kvlen + c) * D) + d] = deq_q4_one(row, d);
+                }
+    }
+
     void *dQ, *dK, *dV, *dO;
     // kernel writes O at [batch][row][head][d] with batch stride = q_pad*heads_q*D
     // (kernel lines 841-844; scatter kernel reads the same layout)
     CK(cudaMalloc(&dQ, Qh.size() * sizeof(El)));
-    CK(cudaMalloc(&dK, Kh.size() * sizeof(El)));
-    CK(cudaMalloc(&dV, Vh.size() * sizeof(El)));
+    CK(cudaMalloc(&dK, tc.k_q4 ? Kq4b.size() : Kh.size() * sizeof(El)));
+    CK(cudaMalloc(&dV, tc.v_q4 ? Vq4b.size() : Vh.size() * sizeof(El)));
     CK(cudaMalloc(&dO, (size_t) nb * q_pad * heads_q * D * (tc.f32out ? sizeof(float) : sizeof(El))));
     CK(cudaMemcpy(dQ, Qh.data(), Qh.size() * sizeof(El), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dK, Kh.data(), Kh.size() * sizeof(El), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dV, Vh.data(), Vh.size() * sizeof(El), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dK, tc.k_q4 ? (const void*) Kq4b.data() : (const void*) Kh.data(),
+                  tc.k_q4 ? Kq4b.size() : Kh.size() * sizeof(El), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dV, tc.v_q4 ? (const void*) Vq4b.data() : (const void*) Vh.data(),
+                  tc.v_q4 ? Vq4b.size() : Vh.size() * sizeof(El), cudaMemcpyHostToDevice));
     auto kernel     = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
     auto kernel_f32 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float>;
     auto kernel_s3  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true>;
+    // q4-direct instantiations (8/23): K / V / K+V, dense and SplitKV3.
+    auto kernel_q4k   = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  false>;
+    auto kernel_q4v   = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true>;
+    auto kernel_q4kv  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  true>;
+    auto kernel_s3q4k = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true,  true,  false>;
     static bool smem_raised = false;
     if (!smem_raised) {
-        CK(cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
-        CK(cudaFuncSetAttribute((const void*) kernel_f32, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
-        CK(cudaFuncSetAttribute((const void*) kernel_s3, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+        for (const void* kfn : {(const void*) kernel, (const void*) kernel_f32, (const void*) kernel_s3,
+                                (const void*) kernel_q4k, (const void*) kernel_q4v, (const void*) kernel_q4kv,
+                                (const void*) kernel_s3q4k}) {
+            CK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+        }
         smem_raised = true;
     }
     const dim3 block(Traits::kNThreads);
@@ -217,6 +310,11 @@ static int run_case(const Case& tc, bool oob) {
         v_row_stride  = D;
         v_head_stride = (int) head_s;
     }
+    // q4-direct overrides: byte strides over the raw [ctx][head][block]
+    // cache (row = hkv*144B, head = 144B) — what the launcher passes as
+    // K->nb[1]/K->nb[2] when K->type == GGML_TYPE_Q4_0.
+    if (tc.k_q4) { k_row_stride = hkv * 144; k_head_stride = 144; }
+    if (tc.v_q4) { v_row_stride = hkv * 144; v_head_stride = 144; }
 
     if (tc.splitkv3) {
         // SplitKV3 path: 3-way partial kernel (grid.y = 3) + merge kernel.
@@ -228,7 +326,8 @@ static int run_case(const Case& tc, bool oob) {
         CK(cudaMalloc(&dPmax, (size_t) (3 * rows3) * sizeof(float)));
         CK(cudaMalloc(&dPsum, (size_t) (3 * rows3) * sizeof(float)));
         const dim3 grid3(q_pad / 64, 3, heads_q);
-        kernel_s3<<<grid3, block, Traits::kSmemBytes, 0>>>(
+        const auto kfn = tc.k_q4 ? kernel_s3q4k : kernel_s3;
+        kfn<<<grid3, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
@@ -246,7 +345,9 @@ static int run_case(const Case& tc, bool oob) {
         CK(cudaFree(dPmax));
         CK(cudaFree(dPsum));
     } else if (tc.f32out) {
-        kernel_f32<<<grid, block, Traits::kSmemBytes, 0>>>(
+        const auto kfn = tc.k_q4 ? (tc.v_q4 ? kernel_q4kv : kernel_q4k)
+                                 : (tc.v_q4 ? kernel_q4v : kernel_f32);
+        kfn<<<grid, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
@@ -377,6 +478,14 @@ int main(int argc, char** argv) {
         // exercises the empty-split gmem guard (must not crash, zero contribution).
         { "splitkv3-600",  1, 600, 279, false, false, true, 1.0f, false, true },
         { "splitkv3-edge", 1, 279, 279, false, false, true, 1.0f, false, true },
+        // 8/23 q4-direct port: raw q4_0 K/V caches read in-kernel (no f16
+        // staging). q4K-pV = full production geometry (-ctk q4_0 -ctv f16:
+        // q4 K direct + paged f16 V). q4KV = both tensors quantized. q4K-s3
+        // = q4-direct combined with the 3-way KV split + merge.
+        { "q4K-pV",     1, 279, 279, false, true,  true, 1.0f, false, false, true,  false },
+        { "q4KV-279",   1, 279, 279, false, false, true, 1.0f, false, false, true,  true  },
+        { "q4KV-3000",  1, 3000, 3000, true,  false, true, 1.0f, false, false, true,  true  },
+        { "q4K-s3",     1, 600, 279, false, false, true, 1.0f, false, true,  true,  false },
     };
     static const Case big[] = {
         { "full-32k",    1, 32768, 32768, true },
