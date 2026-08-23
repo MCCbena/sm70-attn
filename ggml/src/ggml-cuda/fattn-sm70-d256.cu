@@ -42,6 +42,7 @@
 #include "fattn-common.cuh"
 #include "fattn-sm70-d256-kernel.cuh"
 #include <cstdio>
+#include <vector>
 
 #ifndef M_LOG2E
 #define M_LOG2E 1.4426950408889634f
@@ -158,6 +159,67 @@ static bool sm70_env_disabled() {
         return e && e[0] == '0';
     }();
     return disabled;
+}
+
+// 8/23 cause hunt: capture the FIRST sm70 invocation's actual kernel inputs
+// (dequantized K, raw V cache, staged Q) for offline minimal reproduction of
+// the 0.69 real-input divergence. Env: SM70_DUMP_KV=<path>. Fires once per
+// process (the first ACCEPT call = first full-attn layer of the first chunk,
+// whose inputs are bit-identical across ON/OFF since only linear-attention
+// layers precede it). File layout (little-endian):
+//   u32 magic=0x51444B53, u32 version=1,
+//   u32 kv_len, u32 q_len, u32 q_pad, u32 hkv, u32 heads_q,
+//   i64 k_row_stride, i64 k_head_stride, i64 v_row_stride, i64 v_head_stride,
+//   u64 k_count, u64 v_count, u64 q_count   (half element counts)
+//   K blob (f16) | V blob (f16, raw cache memory incl. pos-major layout) | Q blob (f16)
+static void sm70_dump_kernel_inputs(
+        const half * K_h2, int64_t k_row_stride, int64_t k_head_stride,
+        const half * V_h2, int64_t v_row_stride, int64_t v_head_stride,
+        const half * Qs, int q_pad,
+        int kv_len, int q_len, int hkv, int heads_q) {
+    static const char * path = getenv("SM70_DUMP_KV");
+    static bool done = false;
+    if (!path || done) {
+        return;
+    }
+    done = true;
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[sm70-dump-kv] cannot open %s for writing\n", path);
+        return;
+    }
+    // dump spans: enough raw halves to cover every (head, ctx) pair under the
+    // actual strides (pos-major V: kv_len*v_row_stride covers all heads).
+    const int64_t k_span = (int64_t) hkv * k_head_stride;      // contiguous dequant
+    const int64_t v_span = v_row_stride >= v_head_stride
+        ? (int64_t) kv_len * v_row_stride
+        : (int64_t) hkv * v_head_stride;
+    const int64_t q_count = (int64_t) heads_q * q_pad * 256;
+    const uint32_t hdr[7] = {
+        0x51444B53u, 1u,
+        (uint32_t) kv_len, (uint32_t) q_len, (uint32_t) q_pad,
+        (uint32_t) hkv, (uint32_t) heads_q,
+    };
+    const int64_t strides[4] = { k_row_stride, k_head_stride, v_row_stride, v_head_stride };
+    const uint64_t counts[3] = { (uint64_t) k_span, (uint64_t) v_span, (uint64_t) q_count };
+    fwrite(hdr, 1, sizeof(hdr), f);
+    fwrite(strides, 1, sizeof(strides), f);
+    fwrite(counts, 1, sizeof(counts), f);
+    // K/Q live in this stream's allocations; sync before reading from host.
+    // (called before the kernel launch, after dequant+staging kernels)
+    std::vector<half> tmp;
+    tmp.resize((size_t) (k_span > v_span ? k_span : v_span));
+    cudaMemcpy(tmp.data(), K_h2, sizeof(half) * k_span, cudaMemcpyDeviceToHost);
+    fwrite(tmp.data(), sizeof(half), k_span, f);
+    tmp.resize((size_t) v_span);
+    cudaMemcpy(tmp.data(), V_h2, sizeof(half) * v_span, cudaMemcpyDeviceToHost);
+    fwrite(tmp.data(), sizeof(half), v_span, f);
+    tmp.resize((size_t) q_count);
+    cudaMemcpy(tmp.data(), Qs, sizeof(half) * q_count, cudaMemcpyDeviceToHost);
+    fwrite(tmp.data(), sizeof(half), q_count, f);
+    fclose(f);
+    fprintf(stderr, "[sm70-dump-kv] wrote %s (k=%lld v=%lld q=%lld halves)\n",
+            path, (long long) k_span, (long long) v_span, (long long) q_count);
 }
 
 // Routing probe: prints why a decision was made. Default = first decision
@@ -388,6 +450,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     // ------------------------------------------------------------- attention
+    // 8/23 cause hunt: capture this (first) invocation's kernel inputs.
+    sm70_dump_kernel_inputs(K_h2, k_row_stride, k_head_stride,
+                            V_h2, v_row_stride, v_head_stride,
+                            Qs, q_pad, kv_len, q_len, hkv, hkv * gqa);
     using Traits = FLASH_NAMESPACE::Sm70D256SplitDTraits;
     using El = cutlass::half_t;
     // ElOut=float: attention output stays f32 end-to-end (8/23 review — the f16
