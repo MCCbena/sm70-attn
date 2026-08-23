@@ -1,0 +1,26 @@
+fix mtmd + dflash: M-RoPE draft-cache positions (upstream #27408)
+
+Feeding an image to a multimodal model with --spec-type draft-dflash
+failed with llama_decode(ctx_dft) rc=-1 -> HTTP 500 "failed to process
+mtmd chunk". Same bug as upstream PR #27342 (tracked as ggml-org#27408):
+multimodal batches carry a CONSTANT position per row (752 rows all at
+pos 53; spatial structure lives in the target M-RoPE machinery), the
+next text continues at image_pos + grid_height (100), and the draft 1-D
+cache can store neither shape.
+
+Fix in common/speculative.cpp (dflash impl, z-lab fork #1 approach):
+- process(): skip embedding batches; zero-fill the hole with zero-
+  feature encoder rows when the next token batch arrives. Draft tokens
+  are target-validated, so output stays exact - only the acceptance
+  rate dips across the image span.
+- draft(): noise block base = draft memory pos_max + 1 instead of
+  dp.n_past (token count and position scale diverge after any image;
+  the server post-acceptance seq_rm(pos_next, -1) keeps pos_max at the
+  accepted context end exactly).
+- begin(): pos_max-vs-N warning downgraded to a debug heuristic.
+
+Validated end-to-end: image HTTP 200 with correct visual content
+(noise grid -> "pixelated checkerboard"), zero decode failures,
+zero-fill fires once per image; text-only acceptance 0.88 unchanged.
+Also handles prompt-cache reuse gaps (previously a hard failure).
+Repro: verify/mtmd_repro.sh, vision: verify/mtmd_vision_check.py.

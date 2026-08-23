@@ -59,6 +59,38 @@ Meanwhile the narrow loads make the attention kernel itself 3.6% slower at
 176k (457 vs 474 tok/s). Net: the opt-in trades ~4% prefill speed for ~470MB
 of VRAM (the f16 mirror at `-c 229k`) — only worth it when memory-bound.
 
+## mtmd + dflash spec decode: M-RoPE position fix (8/24, upstream #27408)
+
+Feeding an image to a multimodal model with `--spec-type draft-dflash` crashed
+the request with `llama_decode(ctx_dft) rc=-1` -> HTTP 500 "failed to process
+mtmd chunk". Root cause (inherited from the PR #27342 dflash2 port, tracked
+upstream as ggml-org#27408): multimodal batches arrive with a CONSTANT
+position per row (752 image rows all at pos 53; the spatial structure lives
+in the target's M-RoPE machinery), while the following text continues at
+image_pos + grid_height (53+47), not image_pos + n_rows. The draft's 1-D KV
+cache can store neither shape — chunk 2 of the ubatch loop failed the
+continuity check.
+
+Fix (three surgical changes in `common/speculative.cpp`, z-lab fork #1
+approach adapted to our real-feature injection):
+
+1. `process()` skips embedding batches entirely; the hole is zero-filled
+   with zero-feature encoder rows when the next token batch arrives (the
+   target still validates every drafted token — output distribution stays
+   exact, only the acceptance rate dips across the image span).
+2. `draft()` places the noise block at the draft cache's own `pos_max + 1`
+   instead of `dp.n_past` (token count vs position scale diverge after any
+   image; the server's post-acceptance `seq_rm(pos_next, -1)` keeps
+   `pos_max` exactly at the accepted context end).
+3. The `begin()` pos_max-vs-N warning became a debug heuristic (token/pos
+   divergence makes it meaningless after images).
+
+Validated: image requests HTTP 200 with correct visual descriptions (noise
+grid -> "pixelated checkerboard pattern"), zero decode failures, zero-fill
+fires exactly once per image (47 rows for the logo), text-only acceptance
+0.88 (production-normal; image span dips to ~0.57 and recovers). Repro:
+`verify/mtmd_repro.sh [image] [n]`, vision check: `verify/mtmd_vision_check.py`.
+
 ## Upstream (1Cat-vLLM) status: exhausted (8/24)
 
 Decision-grade measurements that closed the portability question (the full

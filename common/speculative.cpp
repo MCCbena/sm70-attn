@@ -1065,10 +1065,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_reset[seq_id] = true;
 
+        // NB (M-RoPE fix, #27408): pos_max is compared against the TARGET
+        // token count N — the two diverge whenever the context holds an
+        // mtmd image (rows count as tokens but advance positions by the
+        // grid height only), so this is a debug heuristic, not a warning.
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
-            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
-                    "Drafts may degrade.\n",
+            SPC_DBG("%s: ctx_dft pos_max=%d < N-1=%d (token/position scale divergence "
+                    "or process() missed a prefill ubatch)\n",
                     __func__, (int) pos_max, N - 1);
         }
     }
@@ -1089,12 +1093,90 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
+        // M-RoPE fix (upstream issue ggml-org#27408; z-lab fork PR #1
+        // approach, validated there for output exactness): multimodal
+        // batches arrive with a CONSTANT position per row (the image's
+        // sequence position — the spatial structure lives in the target's
+        // M-RoPE machinery), and the following text continues at
+        // image_pos + grid_height, not image_pos + n_rows. The draft's 1-D
+        // cache cannot store either shape, so embedding batches are
+        // SKIPPED entirely; the hole they leave is zero-filled when the
+        // next token batch arrives (draft tokens are always validated by
+        // the target, so zeros only dip the acceptance rate across the
+        // image span — the output distribution stays exact).
+        if (has_embeddings) {
+            SPC_DBG("skipping %d multimodal rows (M-RoPE; zero-filled on next token batch)\n",
+                    (int) batch_in.n_tokens);
+            return true;
+        }
+
         const int32_t n_tokens = batch_in.n_tokens;
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        // Per-sequence gap fill: zero-feature rows for positions
+        // [pos_max + 1, first_pos) left by skipped mtmd chunks (or
+        // cache-reuse prefixes the draft never saw).
+        {
+            std::vector<llama_pos> first_pos(n_seq, (llama_pos) INT32_MIN);
+            for (int32_t j = 0; j < (int32_t) batch_in.n_tokens; ++j) {
+                const llama_seq_id seq_id = batch_in.seq_id[j][0];
+                if (first_pos[seq_id] == (llama_pos) INT32_MIN) {
+                    first_pos[seq_id] = batch_in.pos[j];
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (first_pos[seq_id] == (llama_pos) INT32_MIN) {
+                    continue;
+                }
+                auto * mem_dft = llama_get_memory(params.ctx_dft);
+                const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+                const int32_t gap = (int32_t) (first_pos[seq_id] - (pos_max + 1));
+                for (int32_t off = 0; off < gap; off += n_ubatch) {
+                    const int32_t n_fill = std::min(n_ubatch, gap - off);
+                    features_buf.assign((size_t) n_fill * n_embd_enc, 0.0f);
+                    llama_batch enc_batch = {
+                        /*.n_tokens =*/ n_fill,
+                        /*.token    =*/ nullptr,
+                        /*.embd     =*/ features_buf.data(),
+                        /*.pos      =*/ nullptr,
+                        /*.n_seq_id =*/ nullptr,
+                        /*.seq_id   =*/ nullptr,
+                        /*.logits   =*/ nullptr,
+                    };
+                    if (llama_encode(ctx_dft, enc_batch) != 0) {
+                        LOG_ERR("%s: llama_encode(ctx_dft) gap-fill failed (seq=%d, off=%d)\n",
+                                __func__, (int) seq_id, (int) off);
+                        return false;
+                    }
+                    const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                    GGML_ASSERT(inp_g && "DFlash gap-fill encoder produced no output.");
+                    batch_inject.n_tokens = n_fill;
+                    std::memcpy(batch_inject.embd, inp_g,
+                                (size_t) n_fill * n_embd_dec * sizeof(float));
+                    for (int32_t i = 0; i < n_fill; ++i) {
+                        batch_inject.pos[i]       = pos_max + 1 + off + i;
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
+                    }
+                    if (llama_decode(ctx_dft, batch_inject) != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) gap-fill failed rc (seq=%d, off=%d, gap=%d)\n",
+                                __func__, (int) seq_id, (int) off, (int) gap);
+                        return false;
+                    }
+                    llama_synchronize(ctx_dft);
+                }
+                if (gap > 0) {
+                    LOG_WRN("%s: zero-filled %d draft-cache hole rows for seq %d "
+                            "(skipped mtmd chunk / reused prefix)\n",
+                            __func__, (int) gap, (int) seq_id);
+                }
+            }
+        }
 
         // Flatten token-wise encoder work into shared chunks while preserving each row's position and sequence.
         for (int32_t offset = 0; offset < n_tokens; offset += n_ubatch) {
@@ -1128,7 +1210,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         __func__, rc, (int) n_chunk, (int) offset);
                 return false;
             }
-
             const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
             GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
@@ -1139,6 +1220,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(batch_in.n_seq_id[j] == 1);
                 const llama_seq_id seq_id = batch_in.seq_id[j][0];
                 GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+                // token rows carry linear target positions — inject as-is
+                // (gaps from skipped mtmd chunks were zero-filled above).
                 batch_inject.pos[i]       = batch_in.pos[j];
                 batch_inject.n_seq_id[i]  = 1;
                 batch_inject.seq_id[i][0] = seq_id;
@@ -1176,7 +1259,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t n = (int32_t) dp.n_past;
+            // M-RoPE position fix (upstream ggml-org#27408, second half):
+            // dp.n_past counts TARGET tokens, which diverge from the draft
+            // cache's 1-D positions after an mtmd image (752-row image =
+            // 752 tokens but only ~grid_height positions; see process()).
+            // The server's post-acceptance seq_rm(pos_next, -1) rolls the
+            // draft cache back to exactly the accepted context every round
+            // (pos_next is position-scale), so the cache's own pos_max + 1
+            // is always the correct noise-block base.
+            const int32_t n = (int32_t) llama_memory_seq_pos_max(
+                                  llama_get_memory(ctx_dft), seq_id) + 1;
 
             const int32_t n_draft = params.n_max;
 
