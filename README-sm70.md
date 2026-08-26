@@ -16,7 +16,7 @@ speculative decoding and multimodal fixes.
 ![Perf](https://img.shields.io/badge/176k%20prefill-%2B39.9%25-16a34a)
 ![Gates](https://img.shields.io/badge/harness-23%2F23%20PASS-6366f1)
 
-**English** · [中文](README-sm70.zh.md)
+**English** · [中文](README.md)
 
 </div>
 
@@ -297,7 +297,6 @@ Key file details:
   sm70-vendor/README.md for provenance.
 - `sm70-hook.patch` — the fattn.cu hook as a standalone patch for rebase
   re-apply.
-- `sync.sh` — upstream rebase script (run on the VM side).
 
 ## Branches & sync
 

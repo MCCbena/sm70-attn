@@ -15,7 +15,7 @@
 ![Perf](https://img.shields.io/badge/176k%20prefill-%2B39.9%25-16a34a)
 ![Gates](https://img.shields.io/badge/harness-23%2F23%20PASS-6366f1)
 
-[English](README-sm70.md) · **中文**
+[English](README-sm70.md)
 
 </div>
 
@@ -266,7 +266,6 @@ bench/prompt_176k.txt            # ROI 负载（勿改动）
   62750a2b，Apache-2.0）+ flash/（zhinianqin/flash-attention-v100 @
   c2eda5e6 的 FA2 base layer，BSD-3）。出处见 sm70-vendor/README.md。
 - `sm70-hook.patch` — fattn.cu 钩子独立补丁，rebase 重放用。
-- `sync.sh` — 上游 rebase 脚本（在 VM 侧运行）。
 
 ## 分支与同步
 
