@@ -340,5 +340,10 @@ Key file details:
   closure (Apache-2.0)
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — host (MIT)
 
+Human–AI collaboration: every commit involving AI since 2026-08-25
+carries a `Co-authored-by: Hermes-天机` trailer. The 7 commits from 08-18 to
+08-24 (incl. the 9-line stride fix `284b251`) predate that convention and
+were pushed without the trailer; this line covers them.
+
 License follows upstream: MIT (llama.cpp parts) + BSD-3 (flash vendor) +
 Apache-2.0 (cutlass vendor).
