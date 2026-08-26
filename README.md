@@ -84,6 +84,10 @@ llama.cpp 原生路径，无需配置。
 | `LLAMA_SM70_D256_DEBUG` | `0` | 打印 kernel 选路 probe（ACCEPT/REJECT 及原因） |
 | `SM70_DUMP` / `SM70_DUMP_KV` | off | 捕获 kernel 输入/输出用于离线复现与三相定责 |
 
+## CI 说明
+
+继承 llama.cpp 的构建 CI 矩阵作为 PR 编译检查（15 条 build 类 + 每小时缓存预热）；上游的 docker / release 流水线已于 2026-08 移除——本仓库不发布 Docker 镜像与全平台 release，不维护无人消费的流水线。需要时直接从上游 `ggml-org/llama.cpp` 取回对应文件。
+
 ## 验证体系（概览）
 
 每一处改动都被这些门拦着，全部自包含可复跑（`bash verify/<脚本>`）：
