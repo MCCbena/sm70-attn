@@ -12,7 +12,7 @@
 ![FA](https://img.shields.io/badge/FlashAttention-D256%20Split--D-3b82f6)
 ![SplitKV3](https://img.shields.io/badge/KV%20Split-3--way-22c55e)
 ![KV](https://img.shields.io/badge/KV%20Cache-q4_0%20%2B%20f16-f97316)
-![Perf](https://img.shields.io/badge/176k%20prefill-%2B42.9%25-16a34a)
+![Perf](https://img.shields.io/badge/176k%20prefill-%2B39.9%25-16a34a)
 ![Gates](https://img.shields.io/badge/harness-23%2F23%20PASS-6366f1)
 
 [English](README-sm70.md) · **中文**
@@ -44,8 +44,7 @@ V100 单卡 · Qwen3.8-27B Q4_K_XL · `-fa on -ctk q4_0 -ctv f16`：
 
 | 负载 | stock | sm70-attn | 提升 |
 |:---|---:|---:|---:|
-| 176k prefill（G3b 同场 A/B，8/23） | 304.71 tok/s | 435.62 tok/s | **+42.9%** |
-| 176k prefill（8/24 单发复测） | — | 474.00 tok/s | 当前最高 |
+| 176k prefill（8/26 同场 A/B，唯一保留基准） | 372.94 tok/s | 521.93 tok/s | **+39.9%** |
 | 46k prefill（G3） | ≈ stock×1.0 | 613.25 tok/s | 长前缀增益显著 |
 | 8k 上下文 decode（tg64） | 28.99 tok/s | 29.06 tok/s | 持平（模型前向瓶颈） |
 
