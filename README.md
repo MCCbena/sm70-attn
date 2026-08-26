@@ -302,5 +302,7 @@ bench/prompt_176k.txt            # ROI 负载（勿改动）
   闭包（Apache-2.0）
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) —— 宿主（MIT）
 
+人机协作声明：自 2026-08-25 起，凡有人工智能参与编写的提交均带 `Co-authored-by: Hermes-天机` 尾注；8/18–8/24 的 7 笔提交（含 9 行 stride 修复 `284b251`）在署名约定建立前推上，未补尾注，以此行为覆盖声明。
+
 许可随上游：MIT（llama.cpp 部分）+ BSD-3（flash vendor）+ Apache-2.0
 （cutlass vendor）。
