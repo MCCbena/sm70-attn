@@ -1,46 +1,14 @@
-<div align="center">
-
 # sm70-attn
-
-**FlashAttention brought back to Tesla V100 — a deep llama.cpp fork**
-
-An SM 7.0 (V100) CUDA kernel plugin for Qwen3.5/3.6/3.8-27B
-(head_dim=256, GQA 6:1, 16 full-attention layers), plus DFlash2
-speculative decoding and multimodal fixes.
-
-![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia&logoColor=white)
-![SM](https://img.shields.io/badge/SM_7.0-Volta-76B900?logo=nvidia&logoColor=white)
-![FA](https://img.shields.io/badge/FlashAttention-D256%20Split--D-3b82f6)
-![SplitKV3](https://img.shields.io/badge/KV%20Split-3--way-22c55e)
-![KV](https://img.shields.io/badge/KV%20Cache-q4_0%20%2B%20f16-f97316)
-![Perf](https://img.shields.io/badge/176k%20prefill-%2B42.9%25-16a34a)
-![Gates](https://img.shields.io/badge/harness-23%2F23%20PASS-6366f1)
-
-**English** · [中文](README.md)
-
-</div>
-
----
 
 Private fork of llama.cpp carrying a SM70 (V100) D256 flash-attention plugin for
 Qwen3.5/3.6/3.8-27B (head_dim=256, GQA 6:1, 16 full-attention layers).
-
-### Attention path at 176k, measured (Nsight Compute)
-
-![176k attention-path flamegraph](media/flamegraph-176k.png)
-
-Real kernel times of the attention pipeline during a 176,000-token prefill on
-V100: the Split-D kernel is **97% of the path (162 s of pure HMMA)**; the K
-dequant staging costs 2.6% and SplitKV3 merge + Q staging under 0.4% — no
-low-hanging fruit left on the attention side, and the quantitative basis for
-declining the 1Cat XQA decode port.
 
 ## What is in here
 
 - Upstream master baseline (tag `baseline-2026-08-18` = ggml-org/llama.cpp `25ae3a9b3`).
 - `bench/prompt_46k.txt` - deterministic synthetic 46300-token prompt
   (Qwen tokenizer), the standard A/B workload. Do not edit.
-- `bench/prompt_176k.txt` - 176292-token standard workload (the ROI
+- `bench/prompt_176k.txt` - 176340-token standard workload (the ROI
   shape; attention is 62% of prefill time here). Do not edit.
 - `ggml/src/ggml-cuda/fattn.cu` - hook (guarded by cc==700 + head_dim==256
   + causal mask + prefill ne[1]>=256; F16/Q4_0 K/V only). All other shapes
@@ -103,10 +71,8 @@ image_pos + grid_height (53+47), not image_pos + n_rows. The draft's 1-D KV
 cache can store neither shape — chunk 2 of the ubatch loop failed the
 continuity check.
 
-Fix (three surgical changes in `common/speculative.cpp`; the zero-fill
-approach originates from the [z-lab fork #1](https://github.com/z-lab/llama.cpp-fork),
-with the noise-block base change — the part that keeps speculative decoding
-working on image requests — and the end-to-end validation being our additions):
+Fix (three surgical changes in `common/speculative.cpp`, z-lab fork #1
+approach adapted to our real-feature injection):
 
 1. `process()` skips embedding batches entirely; the hole is zero-filled
    with zero-feature encoder rows when the next token batch arrives (the
@@ -178,11 +144,12 @@ instantiation to keep `(-inf)-(-inf)=NaN` out of the partial chain.
   now is the three-way dump verdict below.**
 - G3: 46k prompt prefill A/B (see `bench/prompt_46k.txt`): cumulative
   tokens/s 46k >= 620, 30k >= 640, 4k within 5% of stock.
-  **8/23 rerun: ON 613.25 tok/s.**
 - G3b: 176k prefill A/B (see `bench/prompt_176k.txt`): cumulative
   tokens/s >= 380 (stock baseline 281.5).
-  **8/23 rerun: ON 435.62 / stock 304.71 (+42.9%), post-fix and with
-  SplitKV3; pre-splitkv3 fix-only rerun was 420.00 / 305.17 (+37.6%).**
+  **8/26 final same-day A/B — the only benchmark kept in this repo:
+  ON 521.93 / stock 372.94 tok/s (+39.9%). Same binary, same prompt
+  (176340 tokens), `LLAMA_SM70_D256=0` vs default; prefill wall time
+  337.86s vs 472.83s (-28.5%).**
 - Rollback check: `LLAMA_SM70_D256=0` reproduces stock bit-for-bit.
 - NEW G4 (8/23): harness `verify/sm70_verify` — 19 cases, 0 failing
   (dense / f32-out / spiky / pos-major K,V / SplitKV3 incl. empty-segment
