@@ -90,6 +90,14 @@ back to the llama.cpp native path automatically — no config needed.
 | `LLAMA_SM70_D256_DEBUG` | `0` | Print kernel selection probes (ACCEPT/REJECT + reason) |
 | `SM70_DUMP` / `SM70_DUMP_KV` | off | Capture kernel inputs/outputs for offline repro & three-way blame |
 
+## CI notes
+
+This repo inherits the llama.cpp build CI matrix as compile checks for PRs
+(15 build workflows + an hourly cache warm-up). The upstream docker / release
+pipelines were removed (2026-08): this fork publishes no Docker images and no
+full-platform releases, so unmaintained pipelines were cut. To restore any of
+them, take the corresponding files straight from `ggml-org/llama.cpp`.
+
 ## Validation gates (overview)
 
 Every change is guarded by these gates; all are self-contained and
