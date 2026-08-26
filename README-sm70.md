@@ -343,7 +343,9 @@ Key file details:
 Human–AI collaboration: every commit involving AI since 2026-08-25
 carries a `Co-authored-by: Hermes-天机` trailer. The 7 commits from 08-18 to
 08-24 (incl. the 9-line stride fix `284b251`) predate that convention and
-were pushed without the trailer; this line covers them.
+were pushed without the trailer; five more (2026-08-26, pushed via API:
+`97b131af`/`d59bdb43`/`5988e0e2`/`ed336014`/`12fafd8e`) were likewise omitted.
+This line covers all of them.
 
 License follows upstream: MIT (llama.cpp parts) + BSD-3 (flash vendor) +
 Apache-2.0 (cutlass vendor).
