@@ -37,6 +37,7 @@ def test_slot_save_restore():
     })
     assert res.status_code == 200
     assert res.body["n_saved"] == 84
+    assert os.path.getsize(os.path.join("tmp", "slot1.bin")) == res.body["n_written"]
 
     # Since we have cache, this should only process the last tokens
     res = server.make_request("POST", "/completion", data={
@@ -187,6 +188,7 @@ def mmproj_server():
 
 def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
     server = mmproj_server
+    server.slot_save_checkpoints = 2
     server.start()
 
     # A pure-text prompt processed on slot 1 of a multimodal server.
@@ -214,13 +216,16 @@ def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
     assert res.status_code == 200
     assert res.body["n_restored"] == n_saved
 
-    # Prefix reuse is not checked with the default SWA cache.
+    assert os.path.getsize(os.path.join("tmp", "mm_slot1.bin")) > res.body["n_read"]
+
     res = server.make_request("POST", "/completion", data={
         "prompt": "The quick brown fox jumps over the lazy dog.",
         "id_slot": 0,
         "cache_prompt": True,
     })
     assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["timings"]["prompt_n"] < prompt_n
 
 
 def test_slot_save_restore_with_image(mmproj_server):

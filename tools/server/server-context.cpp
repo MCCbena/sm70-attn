@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <limits>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -689,6 +690,352 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+static constexpr uint64_t SLOT_CHECKPOINTS_MAGIC         = 0x4654504b43534c4cULL;
+static constexpr uint32_t SLOT_CHECKPOINTS_VERSION       = 1;
+static constexpr uint32_t SLOT_CHECKPOINTS_COUNT_MAX     = 1024;
+static constexpr uint64_t SLOT_CHECKPOINTS_SPEC_SIZE_MAX = 64ULL * 1024 * 1024;
+
+static bool slot_checkpoints_write_raw(std::ofstream & file, const void * data, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (size > (size_t) std::numeric_limits<std::streamsize>::max()) {
+        return false;
+    }
+
+    file.write(static_cast<const char *>(data), (std::streamsize) size);
+    return file.good();
+}
+
+template<typename T>
+static bool slot_checkpoints_write(std::ofstream & file, const T & value) {
+    return slot_checkpoints_write_raw(file, &value, sizeof(value));
+}
+
+static bool slot_checkpoints_save(
+        const std::string & filepath,
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        int32_t n_max) {
+    if (n_max <= 0) {
+        return true;
+    }
+
+    const uint32_t n_save = std::min<size_t>(checkpoints.size(), n_max);
+    std::ofstream file(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+    if (!file) {
+        SRV_WRN("failed to open slot save file for checkpoint append: %s\n", filepath.c_str());
+        return false;
+    }
+
+    // [sequence state][trailer header and entries][trailer size][footer magic]
+    const auto trailer_start = file.tellp();
+    if (trailer_start < 0 ||
+            !slot_checkpoints_write(file, SLOT_CHECKPOINTS_MAGIC) ||
+            !slot_checkpoints_write(file, SLOT_CHECKPOINTS_VERSION) ||
+            !slot_checkpoints_write(file, n_save)) {
+        SRV_WRN("failed to write context checkpoint trailer header: %s\n", filepath.c_str());
+        return false;
+    }
+
+    auto it = checkpoints.begin();
+    std::advance(it, checkpoints.size() - n_save);
+
+    for (; it != checkpoints.end(); ++it) {
+        const auto & checkpoint = *it;
+        const uint64_t size_tgt  = checkpoint.data_tgt.size();
+        const uint64_t size_dft  = checkpoint.data_dft.size();
+        const uint64_t size_spec = checkpoint.data_spec.size();
+
+        bool ok = true;
+        ok = ok && slot_checkpoints_write(file, checkpoint.n_tokens);
+        ok = ok && slot_checkpoints_write(file, checkpoint.pos_min);
+        ok = ok && slot_checkpoints_write(file, checkpoint.pos_max);
+        ok = ok && slot_checkpoints_write(file, size_tgt);
+        ok = ok && slot_checkpoints_write(file, size_dft);
+        ok = ok && slot_checkpoints_write(file, size_spec);
+        ok = ok && slot_checkpoints_write_raw(file, checkpoint.data_tgt.data(), checkpoint.data_tgt.size());
+        ok = ok && slot_checkpoints_write_raw(file, checkpoint.data_dft.data(), checkpoint.data_dft.size());
+        ok = ok && slot_checkpoints_write_raw(file, checkpoint.data_spec.data(), checkpoint.data_spec.size());
+        if (!ok) {
+            SRV_WRN("failed to write context checkpoint trailer: %s\n", filepath.c_str());
+            return false;
+        }
+    }
+
+    const auto trailer_end = file.tellp();
+    if (trailer_end < trailer_start) {
+        SRV_WRN("failed to determine context checkpoint trailer size: %s\n", filepath.c_str());
+        return false;
+    }
+
+    const uint64_t trailer_size = trailer_end - trailer_start;
+    if (!slot_checkpoints_write(file, trailer_size) || !slot_checkpoints_write(file, SLOT_CHECKPOINTS_MAGIC)) {
+        SRV_WRN("failed to write context checkpoint trailer footer: %s\n", filepath.c_str());
+        return false;
+    }
+
+    file.flush();
+    if (!file) {
+        SRV_WRN("failed to flush context checkpoint trailer: %s\n", filepath.c_str());
+        return false;
+    }
+
+    SRV_INF("saved %u context checkpoint(s) to %s\n", n_save, filepath.c_str());
+    return true;
+}
+
+static bool slot_state_snapshot(llama_context * ctx, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    if (ctx == nullptr) {
+        data.clear();
+        return true;
+    }
+
+    const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (size == 0) {
+        return false;
+    }
+
+    try {
+        data.resize(size);
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+
+    return llama_state_seq_get_data_ext(ctx, data.data(), data.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == data.size();
+}
+
+static bool slot_state_restore(llama_context * ctx, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    if (ctx == nullptr) {
+        return true;
+    }
+
+    return !data.empty() && llama_state_seq_set_data_ext(ctx, data.data(), data.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == data.size();
+}
+
+static bool slot_checkpoint_validate(
+        const common_prompt_checkpoint & checkpoint,
+        const server_slot & slot,
+        const std::vector<uint8_t> & state_tgt,
+        const std::vector<uint8_t> & state_dft,
+        bool & state_restored) {
+    bool valid = !checkpoint.data_tgt.empty();
+    if (valid) {
+        valid = llama_state_seq_set_data_ext(
+                slot.ctx_tgt, checkpoint.data_tgt.data(), checkpoint.data_tgt.size(), slot.id,
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint.data_tgt.size();
+    }
+
+    if (valid && slot.ctx_dft != nullptr) {
+        valid = !checkpoint.data_dft.empty() && llama_state_seq_set_data_ext(
+                slot.ctx_dft, checkpoint.data_dft.data(), checkpoint.data_dft.size(), slot.id,
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint.data_dft.size();
+    }
+
+    const bool restored_tgt = slot_state_restore(slot.ctx_tgt, slot.id, state_tgt);
+    const bool restored_dft = slot_state_restore(slot.ctx_dft, slot.id, state_dft);
+    state_restored = restored_tgt && restored_dft;
+    return valid && state_restored;
+}
+
+static bool slot_checkpoints_load(
+        const std::string & filepath,
+        const server_slot & slot,
+        size_t n_prompt_tokens,
+        size_t n_state_bytes,
+        int32_t n_max,
+        std::list<common_prompt_checkpoint> & checkpoints) {
+    checkpoints.clear();
+
+    if (n_max <= 0) {
+        return true;
+    }
+
+    std::ifstream file = fs_open_ifstream(filepath, std::ios::binary);
+    if (!file) {
+        return true;
+    }
+
+    file.seekg(0, std::ios::end);
+    const auto file_size = file.tellg();
+    constexpr std::streamoff footer_size = 2 * sizeof(uint64_t);
+    if (file_size < footer_size) {
+        return true;
+    }
+
+    file.seekg(file_size - footer_size);
+    uint64_t trailer_size = 0;
+    uint64_t footer_magic = 0;
+    file.read(reinterpret_cast<char *>(&trailer_size), sizeof(trailer_size));
+    file.read(reinterpret_cast<char *>(&footer_magic), sizeof(footer_magic));
+    if (!file || footer_magic != SLOT_CHECKPOINTS_MAGIC) {
+        if ((uint64_t) file_size > n_state_bytes) {
+            SRV_WRN("ignoring incomplete context checkpoint trailer in %s\n", filepath.c_str());
+        }
+        return true;
+    }
+
+    constexpr uint64_t trailer_header_size = sizeof(uint64_t) + 2 * sizeof(uint32_t);
+    if (trailer_size < trailer_header_size || trailer_size > (uint64_t) (file_size - footer_size)) {
+        SRV_WRN("invalid context checkpoint trailer size in %s\n", filepath.c_str());
+        return true;
+    }
+
+    const auto trailer_start = file_size - footer_size - (std::streamoff) trailer_size;
+    file.seekg(trailer_start);
+    uint64_t remaining = trailer_size;
+
+    auto read_raw = [&](void * data, uint64_t size) {
+        if (size > remaining || size > (uint64_t) std::numeric_limits<std::streamsize>::max()) {
+            return false;
+        }
+        file.read(static_cast<char *>(data), (std::streamsize) size);
+        if (!file) {
+            return false;
+        }
+        remaining -= size;
+        return true;
+    };
+
+    auto skip_raw = [&](uint64_t size) {
+        if (size > remaining || size > (uint64_t) std::numeric_limits<std::streamoff>::max()) {
+            return false;
+        }
+        file.seekg((std::streamoff) size, std::ios::cur);
+        if (!file) {
+            return false;
+        }
+        remaining -= size;
+        return true;
+    };
+
+    uint64_t header_magic = 0;
+    uint32_t version = 0;
+    uint32_t n_checkpoints = 0;
+    if (!read_raw(&header_magic, sizeof(header_magic)) ||
+            !read_raw(&version, sizeof(version)) ||
+            !read_raw(&n_checkpoints, sizeof(n_checkpoints)) ||
+            header_magic != SLOT_CHECKPOINTS_MAGIC ||
+            version != SLOT_CHECKPOINTS_VERSION ||
+            n_checkpoints > SLOT_CHECKPOINTS_COUNT_MAX) {
+        SRV_WRN("invalid context checkpoint trailer header in %s\n", filepath.c_str());
+        return true;
+    }
+
+    if (n_checkpoints == 0) {
+        if (remaining != 0) {
+            SRV_WRN("empty context checkpoint trailer has unexpected data in %s\n", filepath.c_str());
+        } else {
+            SRV_INF("restored 0 context checkpoint(s) from %s\n", filepath.c_str());
+        }
+        return true;
+    }
+
+    std::vector<uint8_t> state_tgt;
+    std::vector<uint8_t> state_dft;
+    if (!slot_state_snapshot(slot.ctx_tgt, slot.id, state_tgt) || !slot_state_snapshot(slot.ctx_dft, slot.id, state_dft)) {
+        SRV_WRN("failed to snapshot restored slot state while loading checkpoints from %s\n", filepath.c_str());
+        return true;
+    }
+
+    const uint64_t size_tgt_max = state_tgt.size();
+    const uint64_t size_dft_max = state_dft.size();
+    const uint32_t n_keep = std::min<uint32_t>(n_checkpoints, n_max);
+    uint32_t n_invalid = 0;
+
+    for (uint32_t i = 0; i < n_checkpoints; ++i) {
+        common_prompt_checkpoint checkpoint;
+        uint64_t size_tgt = 0;
+        uint64_t size_dft = 0;
+        uint64_t size_spec = 0;
+
+        bool ok = true;
+        ok = ok && read_raw(&checkpoint.n_tokens, sizeof(checkpoint.n_tokens));
+        ok = ok && read_raw(&checkpoint.pos_min, sizeof(checkpoint.pos_min));
+        ok = ok && read_raw(&checkpoint.pos_max, sizeof(checkpoint.pos_max));
+        ok = ok && read_raw(&size_tgt, sizeof(size_tgt));
+        ok = ok && read_raw(&size_dft, sizeof(size_dft));
+        ok = ok && read_raw(&size_spec, sizeof(size_spec));
+
+        const bool keep = i >= n_checkpoints - n_keep;
+        ok = ok && size_tgt > 0 && size_tgt <= size_tgt_max;
+        ok = ok && (slot.ctx_dft == nullptr || (size_dft > 0 && size_dft <= size_dft_max));
+        ok = ok && size_spec <= SLOT_CHECKPOINTS_SPEC_SIZE_MAX;
+        const uint64_t remaining_after_tgt = size_tgt <= remaining ? remaining - size_tgt : 0;
+        const uint64_t remaining_after_dft = size_dft <= remaining_after_tgt ? remaining_after_tgt - size_dft : 0;
+        ok = ok && size_tgt <= remaining;
+        ok = ok && size_dft <= remaining_after_tgt;
+        ok = ok && size_spec <= remaining_after_dft;
+        if (!ok) {
+            SRV_WRN("invalid context checkpoint %u in %s\n", i, filepath.c_str());
+            checkpoints.clear();
+            return true;
+        }
+
+        try {
+            if (keep) {
+                checkpoint.data_tgt.resize(size_tgt);
+                ok = read_raw(checkpoint.data_tgt.data(), size_tgt);
+            } else {
+                ok = skip_raw(size_tgt);
+            }
+
+            if (keep && slot.ctx_dft != nullptr) {
+                checkpoint.data_dft.resize(size_dft);
+                ok = ok && read_raw(checkpoint.data_dft.data(), size_dft);
+            } else {
+                ok = ok && skip_raw(size_dft);
+            }
+
+            if (keep && slot.spec != nullptr) {
+                checkpoint.data_spec.resize(size_spec);
+                ok = ok && read_raw(checkpoint.data_spec.data(), size_spec);
+            } else {
+                ok = ok && skip_raw(size_spec);
+            }
+        } catch (const std::bad_alloc &) {
+            ok = false;
+        }
+
+        if (!ok) {
+            SRV_WRN("truncated context checkpoint %u in %s\n", i, filepath.c_str());
+            checkpoints.clear();
+            return true;
+        }
+
+        if (!keep) {
+            continue;
+        }
+
+        checkpoint.id_task = -1;
+        const bool metadata_valid = checkpoint.n_tokens > 0 &&
+                checkpoint.n_tokens <= (int64_t) n_prompt_tokens &&
+                checkpoint.pos_min >= 0 && checkpoint.pos_max >= checkpoint.pos_min;
+        bool state_restored = true;
+        if (!metadata_valid || !slot_checkpoint_validate(checkpoint, slot, state_tgt, state_dft, state_restored)) {
+            ++n_invalid;
+            if (!state_restored) {
+                SRV_ERR("failed to reinstate restored slot state while validating checkpoints from %s\n", filepath.c_str());
+                return false;
+            }
+            continue;
+        }
+
+        checkpoints.push_back(std::move(checkpoint));
+    }
+
+    if (remaining != 0) {
+        SRV_WRN("context checkpoint trailer has unexpected data in %s\n", filepath.c_str());
+        checkpoints.clear();
+        return true;
+    }
+
+    if (n_invalid > 0) {
+        SRV_WRN("dropped %u invalid context checkpoint(s) from %s\n", n_invalid, filepath.c_str());
+    }
+    SRV_INF("restored %zu context checkpoint(s) from %s\n", checkpoints.size(), filepath.c_str());
+    return true;
+}
 
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
@@ -2465,6 +2812,8 @@ private:
                         break;
                     }
 
+                    slot_checkpoints_save(filepath, slot->prompt.checkpoints, params_base.n_slot_save_checkpoints);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2522,8 +2871,15 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
+                        std::list<common_prompt_checkpoint> checkpoints;
+                        if (!slot_checkpoints_load(
+                                    filepath, *slot, restored.size(), nread, params_base.n_ctx_checkpoints, checkpoints)) {
+                            throw std::runtime_error("Unable to reinstate slot state after checkpoint validation");
+                        }
+
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->prompt.checkpoints = std::move(checkpoints);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

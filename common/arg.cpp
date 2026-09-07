@@ -3586,6 +3586,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-checkpoints"}, "N",
+        string_format("max number of context checkpoints to persist in each slot save (default: %d, 0 = disabled)", params.n_slot_save_checkpoints),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("slot-save-checkpoints must be between 0 and 1024");
+            }
+            params.n_slot_save_checkpoints = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_CHECKPOINTS"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
